@@ -2,7 +2,7 @@ module github.com/filecoin-project/lotus
 
 go 1.14
 
-replace github.com/supranational/blst => github.com/ognots/blst v0.1.2-alpha.1.0.20200814045138-a648ba7cd929
+replace github.com/supranational/blst => github.com/ognots/blst 09bc2d2ab3f44d1cb6987a46ee6448f9620cc497
 
 require (
 	contrib.go.opencensus.io/exporter/jaeger v0.1.0
