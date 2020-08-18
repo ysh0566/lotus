@@ -270,6 +270,7 @@ func (sh *scheduler) diag() SchedDiagInfo {
 		}
 		workerInfo = append(workerInfo, SchedDiagWorkerInfo{window.worker, tt})
 	}
+	sh.workersLk.RUnlock()
 	out.OpenWindows = workerInfo
 
 	//for _, window := range sh.openWindows {
