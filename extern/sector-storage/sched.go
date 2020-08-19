@@ -206,7 +206,7 @@ type SchedDiagRequestInfo struct {
 
 type SchedDiagWorkerInfo struct {
 	WorkerID
-	AcceptedTaskTypes map[sealtasks.TaskType]struct{}
+	AcceptedTaskTypes []sealtasks.TaskType
 }
 
 type SchedDiagInfo struct {
@@ -268,15 +268,15 @@ func (sh *scheduler) diag() SchedDiagInfo {
 		if err != nil {
 			log.Errorw("failed to retrieve worker task types", err)
 		}
-		workerInfo = append(workerInfo, SchedDiagWorkerInfo{window.worker, tt})
+		tta := []sealtasks.TaskType{}
+		for task := range tt {
+			tta = append(tta, task)
+		}
+		workerInfo = append(workerInfo, SchedDiagWorkerInfo{window.worker, tta})
 	}
 	sh.workersLk.RUnlock()
 	out.OpenWindows = workerInfo
 
-	//for _, window := range sh.openWindows {
-	//	out.OpenWindows = append(out.OpenWindows, window.worker)
-	//}
-	//
 	return out
 }
 
