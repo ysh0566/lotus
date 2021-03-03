@@ -3,24 +3,35 @@ package test
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/node/impl"
 )
 
 func TestCCUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration) {
-	_ = os.Setenv("BELLMAN_NO_GPU", "1")
+	for _, height := range []abi.ChainEpoch{
+		2,    // before
+		162,  // while sealing
+		530,  // after upgrade deal
+		5000, // after
+	} {
+		height := height // make linters happy by copying
+		t.Run(fmt.Sprintf("upgrade-%d", height), func(t *testing.T) {
+			testCCUpgrade(t, b, blocktime, height)
+		})
+	}
+}
 
+func testCCUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration, upgradeHeight abi.ChainEpoch) {
 	ctx := context.Background()
-	n, sn := b(t, 1, oneMiner)
+	n, sn := b(t, []FullNodeOpts{FullNodeWithActorsV3At(upgradeHeight)}, OneMiner)
 	client := n[0].FullNode.(*impl.FullNodeAPI)
 	miner := sn[0]
 
@@ -78,19 +89,36 @@ func TestCCUpgrade(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		t.Fatal(err)
 	}
 
-	makeDeal(t, ctx, 6, client, miner, false, false)
+	MakeDeal(t, ctx, 6, client, miner, false, false, 0)
 
 	// Validate upgrade
 
 	{
 		exp, err := client.StateSectorExpiration(ctx, maddr, CC, types.EmptyTSK)
 		require.NoError(t, err)
+		require.NotNil(t, exp)
 		require.Greater(t, 50000, int(exp.OnTime))
 	}
 	{
 		exp, err := client.StateSectorExpiration(ctx, maddr, Upgraded, types.EmptyTSK)
 		require.NoError(t, err)
 		require.Less(t, 50000, int(exp.OnTime))
+	}
+
+	dlInfo, err := client.StateMinerProvingDeadline(ctx, maddr, types.EmptyTSK)
+	require.NoError(t, err)
+
+	// Sector should expire.
+	for {
+		// Wait for the sector to expire.
+		status, err := miner.SectorsStatus(ctx, CC, true)
+		require.NoError(t, err)
+		if status.OnTime == 0 && status.Early == 0 {
+			break
+		}
+		t.Log("waiting for sector to expire")
+		// wait one deadline per loop.
+		time.Sleep(time.Duration(dlInfo.WPoStChallengeWindow) * blocktime)
 	}
 
 	fmt.Println("shutting down mining")

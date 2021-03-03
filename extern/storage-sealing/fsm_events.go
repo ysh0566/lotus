@@ -1,12 +1,12 @@
 package sealing
 
 import (
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
-	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/specs-storage/storage"
 )
 
@@ -101,20 +101,26 @@ func (evt SectorPacked) apply(state *SectorInfo) {
 	}
 }
 
-type SectorPackingFailed struct{ error }
+type SectorTicket struct {
+	TicketValue abi.SealRandomness
+	TicketEpoch abi.ChainEpoch
+}
 
-func (evt SectorPackingFailed) apply(*SectorInfo) {}
+func (evt SectorTicket) apply(state *SectorInfo) {
+	state.TicketEpoch = evt.TicketEpoch
+	state.TicketValue = evt.TicketValue
+}
+
+type SectorOldTicket struct{}
+
+func (evt SectorOldTicket) apply(*SectorInfo) {}
 
 type SectorPreCommit1 struct {
 	PreCommit1Out storage.PreCommit1Out
-	TicketValue   abi.SealRandomness
-	TicketEpoch   abi.ChainEpoch
 }
 
 func (evt SectorPreCommit1) apply(state *SectorInfo) {
 	state.PreCommit1Out = evt.PreCommit1Out
-	state.TicketEpoch = evt.TicketEpoch
-	state.TicketValue = evt.TicketValue
 	state.PreCommit2Fails = 0
 }
 
@@ -191,13 +197,33 @@ type SectorCommitFailed struct{ error }
 func (evt SectorCommitFailed) FormatError(xerrors.Printer) (next error) { return evt.error }
 func (evt SectorCommitFailed) apply(*SectorInfo)                        {}
 
+type SectorRetrySubmitCommit struct{}
+
+func (evt SectorRetrySubmitCommit) apply(*SectorInfo) {}
+
+type SectorDealsExpired struct{ error }
+
+func (evt SectorDealsExpired) FormatError(xerrors.Printer) (next error) { return evt.error }
+func (evt SectorDealsExpired) apply(*SectorInfo)                        {}
+
+type SectorTicketExpired struct{ error }
+
+func (evt SectorTicketExpired) FormatError(xerrors.Printer) (next error) { return evt.error }
+func (evt SectorTicketExpired) apply(*SectorInfo)                        {}
+
 type SectorCommitted struct {
-	Message cid.Cid
-	Proof   []byte
+	Proof []byte
 }
 
 func (evt SectorCommitted) apply(state *SectorInfo) {
 	state.Proof = evt.Proof
+}
+
+type SectorCommitSubmitted struct {
+	Message cid.Cid
+}
+
+func (evt SectorCommitSubmitted) apply(state *SectorInfo) {
 	state.CommitMessage = &evt.Message
 }
 
@@ -256,6 +282,24 @@ type SectorRetryCommitWait struct{}
 
 func (evt SectorRetryCommitWait) apply(state *SectorInfo) {}
 
+type SectorInvalidDealIDs struct {
+	Return ReturnState
+}
+
+func (evt SectorInvalidDealIDs) apply(state *SectorInfo) {
+	state.Return = evt.Return
+}
+
+type SectorUpdateDealIDs struct {
+	Updates map[int]abi.DealID
+}
+
+func (evt SectorUpdateDealIDs) apply(state *SectorInfo) {
+	for i, id := range evt.Updates {
+		state.Pieces[i].DealInfo.DealID = id
+	}
+}
+
 // Faults
 
 type SectorFaulty struct{}
@@ -270,11 +314,40 @@ func (evt SectorFaultReported) apply(state *SectorInfo) {
 
 type SectorFaultedFinal struct{}
 
+// Terminating
+
+type SectorTerminate struct{}
+
+func (evt SectorTerminate) applyGlobal(state *SectorInfo) bool {
+	state.State = Terminating
+	return true
+}
+
+type SectorTerminating struct{ Message *cid.Cid }
+
+func (evt SectorTerminating) apply(state *SectorInfo) {
+	state.TerminateMessage = evt.Message
+}
+
+type SectorTerminated struct{ TerminatedAt abi.ChainEpoch }
+
+func (evt SectorTerminated) apply(state *SectorInfo) {
+	state.TerminatedAt = evt.TerminatedAt
+}
+
+type SectorTerminateFailed struct{ error }
+
+func (evt SectorTerminateFailed) FormatError(xerrors.Printer) (next error) { return evt.error }
+func (evt SectorTerminateFailed) apply(*SectorInfo)                        {}
+
 // External events
 
 type SectorRemove struct{}
 
-func (evt SectorRemove) apply(state *SectorInfo) {}
+func (evt SectorRemove) applyGlobal(state *SectorInfo) bool {
+	state.State = Removing
+	return true
+}
 
 type SectorRemoved struct{}
 

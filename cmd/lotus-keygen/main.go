@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet"
 	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
-	"github.com/filecoin-project/specs-actors/actors/crypto"
 	"github.com/urfave/cli/v2"
 )
 
@@ -22,6 +22,11 @@ func main() {
 			Value:   "bls",
 			Usage:   "specify key type to generate (bls or secp256k1)",
 		},
+		&cli.StringFlag{
+			Name:    "out",
+			Aliases: []string{"o"},
+			Usage:   "specify key file name to generate",
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 		memks := wallet.NewMemKeyStore()
@@ -30,31 +35,40 @@ func main() {
 			return err
 		}
 
-		var kt crypto.SigType
+		var kt types.KeyType
 		switch cctx.String("type") {
 		case "bls":
-			kt = crypto.SigTypeBLS
+			kt = types.KTBLS
 		case "secp256k1":
-			kt = crypto.SigTypeSecp256k1
+			kt = types.KTSecp256k1
 		default:
 			return fmt.Errorf("unrecognized key type: %q", cctx.String("type"))
 		}
 
-		kaddr, err := w.GenerateKey(kt)
+		kaddr, err := w.WalletNew(cctx.Context, kt)
 		if err != nil {
 			return err
 		}
 
-		ki, err := w.Export(kaddr)
+		ki, err := w.WalletExport(cctx.Context, kaddr)
 		if err != nil {
 			return err
 		}
 
-		fi, err := os.Create(fmt.Sprintf("%s.key", kaddr))
+		outFile := fmt.Sprintf("%s.key", kaddr)
+		if cctx.IsSet("out") {
+			outFile = fmt.Sprintf("%s.key", cctx.String("out"))
+		}
+		fi, err := os.Create(outFile)
 		if err != nil {
 			return err
 		}
-		defer fi.Close()
+		defer func() {
+			err2 := fi.Close()
+			if err == nil {
+				err = err2
+			}
+		}()
 
 		b, err := json.Marshal(ki)
 		if err != nil {

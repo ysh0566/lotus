@@ -19,7 +19,7 @@ import (
 	logging "github.com/ipfs/go-log"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/beacon"
@@ -65,6 +65,11 @@ type DrandBeacon struct {
 	localCache map[uint64]types.BeaconEntry
 }
 
+// DrandHTTPClient interface overrides the user agent used by drand
+type DrandHTTPClient interface {
+	SetUserAgent(string)
+}
+
 func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes.DrandConfig) (*DrandBeacon, error) {
 	if genesisTs == 0 {
 		panic("what are you doing this cant be zero")
@@ -84,6 +89,7 @@ func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes
 		if err != nil {
 			return nil, xerrors.Errorf("could not create http drand client: %w", err)
 		}
+		hc.(DrandHTTPClient).SetUserAgent("drand-client-lotus/" + build.BuildVersion)
 		clients = append(clients, hc)
 
 	}
@@ -92,7 +98,6 @@ func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes
 		dclient.WithChainInfo(drandChain),
 		dclient.WithCacheSize(1024),
 		dclient.WithLogger(dlogger),
-		dclient.WithAutoWatch(),
 	}
 
 	if ps != nil {
@@ -187,7 +192,7 @@ func (db *DrandBeacon) VerifyEntry(curr types.BeaconEntry, prev types.BeaconEntr
 	return err
 }
 
-func (db *DrandBeacon) MaxBeaconRoundForEpoch(filEpoch abi.ChainEpoch, prevEntry types.BeaconEntry) uint64 {
+func (db *DrandBeacon) MaxBeaconRoundForEpoch(filEpoch abi.ChainEpoch) uint64 {
 	// TODO: sometimes the genesis time for filecoin is zero and this goes negative
 	latestTs := ((uint64(filEpoch) * db.filRoundTime) + db.filGenTime) - db.filRoundTime
 	dround := (latestTs - db.drandGenTime) / uint64(db.interval.Seconds())

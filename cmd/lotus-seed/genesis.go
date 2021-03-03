@@ -9,14 +9,19 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/filecoin-project/lotus/chain/vm"
+	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
+	"github.com/filecoin-project/lotus/journal"
+	"github.com/filecoin-project/lotus/lib/blockstore"
+	"github.com/filecoin-project/lotus/node/modules/testing"
 	"github.com/google/uuid"
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/gen"
@@ -32,6 +37,7 @@ var genesisCmd = &cli.Command{
 		genesisNewCmd,
 		genesisAddMinerCmd,
 		genesisAddMsigsCmd,
+		genesisCarCmd,
 	},
 }
 
@@ -301,4 +307,29 @@ func parseMultisigCsv(csvf string) ([]GenAccountEntry, error) {
 	}
 
 	return entries, nil
+}
+
+var genesisCarCmd = &cli.Command{
+	Name:        "car",
+	Description: "write genesis car file",
+	ArgsUsage:   "genesis template `FILE`",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    "out",
+			Aliases: []string{"o"},
+			Value:   "genesis.car",
+			Usage:   "write output to `FILE`",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if c.Args().Len() != 1 {
+			return xerrors.Errorf("Please specify a genesis template. (i.e, the one created with `genesis new`)")
+		}
+		ofile := c.String("out")
+		jrnl := journal.NilJournal()
+		bstor := blockstore.NewTemporarySync()
+		sbldr := vm.Syscalls(ffiwrapper.ProofVerifier)
+		_, err := testing.MakeGenesis(ofile, c.Args().First())(bstor, sbldr, jrnl)()
+		return err
+	},
 }

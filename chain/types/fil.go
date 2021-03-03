@@ -12,11 +12,38 @@ import (
 type FIL BigInt
 
 func (f FIL) String() string {
+	return f.Unitless() + " FIL"
+}
+
+func (f FIL) Unitless() string {
 	r := new(big.Rat).SetFrac(f.Int, big.NewInt(int64(build.FilecoinPrecision)))
 	if r.Sign() == 0 {
-		return "0 FIL"
+		return "0"
 	}
-	return strings.TrimRight(strings.TrimRight(r.FloatString(18), "0"), ".") + " FIL"
+	return strings.TrimRight(strings.TrimRight(r.FloatString(18), "0"), ".")
+}
+
+var unitPrefixes = []string{"a", "f", "p", "n", "μ", "m"}
+
+func (f FIL) Short() string {
+	n := BigInt(f).Abs()
+
+	dn := uint64(1)
+	var prefix string
+	for _, p := range unitPrefixes {
+		if n.LessThan(NewInt(dn * 1000)) {
+			prefix = p
+			break
+		}
+		dn *= 1000
+	}
+
+	r := new(big.Rat).SetFrac(f.Int, big.NewInt(int64(dn)))
+	if r.Sign() == 0 {
+		return "0"
+	}
+
+	return strings.TrimRight(strings.TrimRight(r.FloatString(3), "0"), ".") + " " + prefix + "FIL"
 }
 
 func (f FIL) Format(s fmt.State, ch rune) {
@@ -43,7 +70,7 @@ func (f FIL) UnmarshalText(text []byte) error {
 }
 
 func ParseFIL(s string) (FIL, error) {
-	suffix := strings.TrimLeft(s, ".1234567890")
+	suffix := strings.TrimLeft(s, "-.1234567890")
 	s = s[:len(s)-len(suffix)]
 	var attofil bool
 	if suffix != "" {
@@ -55,6 +82,10 @@ func ParseFIL(s string) (FIL, error) {
 		default:
 			return FIL{}, fmt.Errorf("unrecognized suffix: %q", suffix)
 		}
+	}
+
+	if len(s) > 50 {
+		return FIL{}, fmt.Errorf("string length too large: %d", len(s))
 	}
 
 	r, ok := new(big.Rat).SetString(s)
@@ -75,6 +106,15 @@ func ParseFIL(s string) (FIL, error) {
 	}
 
 	return FIL{r.Num()}, nil
+}
+
+func MustParseFIL(s string) FIL {
+	n, err := ParseFIL(s)
+	if err != nil {
+		panic(err)
+	}
+
+	return n
 }
 
 var _ encoding.TextMarshaler = (*FIL)(nil)

@@ -3,16 +3,23 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	stdbig "math/big"
 	"sort"
 	"strconv"
 
+	cid "github.com/ipfs/go-cid"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 
+	lapi "github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/node/config"
 )
 
 var mpoolCmd = &cli.Command{
@@ -20,11 +27,13 @@ var mpoolCmd = &cli.Command{
 	Usage: "Manage message pool",
 	Subcommands: []*cli.Command{
 		mpoolPending,
+		mpoolClear,
 		mpoolSub,
 		mpoolStat,
 		mpoolReplaceCmd,
 		mpoolFindCmd,
 		mpoolConfig,
+		mpoolGasPerfCmd,
 	},
 }
 
@@ -36,6 +45,18 @@ var mpoolPending = &cli.Command{
 			Name:  "local",
 			Usage: "print pending messages for addresses in local wallet only",
 		},
+		&cli.BoolFlag{
+			Name:  "cids",
+			Usage: "only print cids of messages in output",
+		},
+		&cli.StringFlag{
+			Name:  "to",
+			Usage: "return messages to a given address",
+		},
+		&cli.StringFlag{
+			Name:  "from",
+			Usage: "return messages from a given address",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		api, closer, err := GetFullNodeAPI(cctx)
@@ -45,6 +66,23 @@ var mpoolPending = &cli.Command{
 		defer closer()
 
 		ctx := ReqContext(cctx)
+
+		var toa, froma address.Address
+		if tos := cctx.String("to"); tos != "" {
+			a, err := address.NewFromString(tos)
+			if err != nil {
+				return fmt.Errorf("given 'to' address %q was invalid: %w", tos, err)
+			}
+			toa = a
+		}
+
+		if froms := cctx.String("from"); froms != "" {
+			a, err := address.NewFromString(froms)
+			if err != nil {
+				return fmt.Errorf("given 'from' address %q was invalid: %w", froms, err)
+			}
+			froma = a
+		}
 
 		var filter map[address.Address]struct{}
 		if cctx.Bool("local") {
@@ -72,14 +110,58 @@ var mpoolPending = &cli.Command{
 				}
 			}
 
-			out, err := json.MarshalIndent(msg, "", "  ")
-			if err != nil {
-				return err
+			if toa != address.Undef && msg.Message.To != toa {
+				continue
 			}
-			fmt.Println(string(out))
+			if froma != address.Undef && msg.Message.From != froma {
+				continue
+			}
+
+			if cctx.Bool("cids") {
+				fmt.Println(msg.Cid())
+			} else {
+				out, err := json.MarshalIndent(msg, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(out))
+			}
 		}
 
 		return nil
+	},
+}
+
+var mpoolClear = &cli.Command{
+	Name:  "clear",
+	Usage: "Clear all pending messages from the mpool (USE WITH CARE)",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "local",
+			Usage: "also clear local messages",
+		},
+		&cli.BoolFlag{
+			Name:  "really-do-it",
+			Usage: "must be specified for the action to take effect",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		really := cctx.Bool("really-do-it")
+		if !really {
+			//nolint:golint
+			return fmt.Errorf("--really-do-it must be specified for this action to have an effect; you have been warned")
+		}
+
+		local := cctx.Bool("local")
+
+		ctx := ReqContext(cctx)
+		return api.MpoolClear(ctx, local)
 	},
 }
 
@@ -115,14 +197,6 @@ var mpoolSub = &cli.Command{
 	},
 }
 
-type statBucket struct {
-	msgs map[uint64]*types.SignedMessage
-}
-type mpStat struct {
-	addr              string
-	past, cur, future uint64
-}
-
 var mpoolStat = &cli.Command{
 	Name:  "stat",
 	Usage: "print mempool stats",
@@ -130,6 +204,11 @@ var mpoolStat = &cli.Command{
 		&cli.BoolFlag{
 			Name:  "local",
 			Usage: "print stats for addresses in local wallet only",
+		},
+		&cli.IntFlag{
+			Name:  "basefee-lookback",
+			Usage: "number of blocks to look back for minimum basefee",
+			Value: 60,
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -144,6 +223,20 @@ var mpoolStat = &cli.Command{
 		ts, err := api.ChainHead(ctx)
 		if err != nil {
 			return xerrors.Errorf("getting chain head: %w", err)
+		}
+		currBF := ts.Blocks()[0].ParentBaseFee
+		minBF := currBF
+		{
+			currTs := ts
+			for i := 0; i < cctx.Int("basefee-lookback"); i++ {
+				currTs, err = api.ChainGetTipSet(ctx, currTs.Parents())
+				if err != nil {
+					return xerrors.Errorf("walking chain: %w", err)
+				}
+				if newBF := currTs.Blocks()[0].ParentBaseFee; newBF.LessThan(minBF) {
+					minBF = newBF
+				}
+			}
 		}
 
 		var filter map[address.Address]struct{}
@@ -165,8 +258,17 @@ var mpoolStat = &cli.Command{
 			return err
 		}
 
-		buckets := map[address.Address]*statBucket{}
+		type statBucket struct {
+			msgs map[uint64]*types.SignedMessage
+		}
+		type mpStat struct {
+			addr                 string
+			past, cur, future    uint64
+			belowCurr, belowPast uint64
+			gasLimit             big.Int
+		}
 
+		buckets := map[address.Address]*statBucket{}
 		for _, v := range msgs {
 			if filter != nil {
 				if _, has := filter[v.Message.From]; !has {
@@ -203,23 +305,30 @@ var mpoolStat = &cli.Command{
 				cur++
 			}
 
-			past := uint64(0)
-			future := uint64(0)
+			var s mpStat
+			s.addr = a.String()
+			s.gasLimit = big.Zero()
+
 			for _, m := range bkt.msgs {
 				if m.Message.Nonce < act.Nonce {
-					past++
+					s.past++
+				} else if m.Message.Nonce > cur {
+					s.future++
+				} else {
+					s.cur++
 				}
-				if m.Message.Nonce > cur {
-					future++
+
+				if m.Message.GasFeeCap.LessThan(currBF) {
+					s.belowCurr++
 				}
+				if m.Message.GasFeeCap.LessThan(minBF) {
+					s.belowPast++
+				}
+
+				s.gasLimit = big.Add(s.gasLimit, types.NewInt(uint64(m.Message.GasLimit)))
 			}
 
-			out = append(out, mpStat{
-				addr:   a.String(),
-				past:   past,
-				cur:    cur - act.Nonce,
-				future: future,
-			})
+			out = append(out, s)
 		}
 
 		sort.Slice(out, func(i, j int) bool {
@@ -227,17 +336,21 @@ var mpoolStat = &cli.Command{
 		})
 
 		var total mpStat
+		total.gasLimit = big.Zero()
 
 		for _, stat := range out {
 			total.past += stat.past
 			total.cur += stat.cur
 			total.future += stat.future
+			total.belowCurr += stat.belowCurr
+			total.belowPast += stat.belowPast
+			total.gasLimit = big.Add(total.gasLimit, stat.gasLimit)
 
-			fmt.Printf("%s: past: %d, cur: %d, future: %d\n", stat.addr, stat.past, stat.cur, stat.future)
+			fmt.Printf("%s: Nonce past: %d, cur: %d, future: %d; FeeCap cur: %d, min-%d: %d, gasLimit: %s\n", stat.addr, stat.past, stat.cur, stat.future, stat.belowCurr, cctx.Int("basefee-lookback"), stat.belowPast, stat.gasLimit)
 		}
 
 		fmt.Println("-----")
-		fmt.Printf("total: past: %d, cur: %d, future: %d\n", total.past, total.cur, total.future)
+		fmt.Printf("total: Nonce past: %d, cur: %d, future: %d; FeeCap cur: %d, min-%d: %d, gasLimit: %s\n", total.past, total.cur, total.future, total.belowCurr, cctx.Int("basefee-lookback"), total.belowPast, total.gasLimit)
 
 		return nil
 	},
@@ -249,32 +362,27 @@ var mpoolReplaceCmd = &cli.Command{
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "gas-feecap",
-			Usage: "gas feecap for new message",
+			Usage: "gas feecap for new message (burn and pay to miner, attoFIL/GasUnit)",
 		},
 		&cli.StringFlag{
 			Name:  "gas-premium",
-			Usage: "gas price for new message",
+			Usage: "gas price for new message (pay to miner, attoFIL/GasUnit)",
 		},
 		&cli.Int64Flag{
 			Name:  "gas-limit",
-			Usage: "gas price for new message",
+			Usage: "gas limit for new message (GasUnit)",
+		},
+		&cli.BoolFlag{
+			Name:  "auto",
+			Usage: "automatically reprice the specified message",
+		},
+		&cli.StringFlag{
+			Name:  "max-fee",
+			Usage: "Spend up to X attoFIL for this message (applicable for auto mode)",
 		},
 	},
-	ArgsUsage: "[from] [nonce]",
+	ArgsUsage: "<from nonce> | <message-cid>",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 2 {
-			return cli.ShowCommandHelp(cctx, cctx.Command.Name)
-		}
-
-		from, err := address.NewFromString(cctx.Args().Get(0))
-		if err != nil {
-			return err
-		}
-
-		nonce, err := strconv.ParseUint(cctx.Args().Get(1), 10, 64)
-		if err != nil {
-			return err
-		}
 
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
@@ -283,6 +391,39 @@ var mpoolReplaceCmd = &cli.Command{
 		defer closer()
 
 		ctx := ReqContext(cctx)
+
+		var from address.Address
+		var nonce uint64
+		switch cctx.Args().Len() {
+		case 1:
+			mcid, err := cid.Decode(cctx.Args().First())
+			if err != nil {
+				return err
+			}
+
+			msg, err := api.ChainGetMessage(ctx, mcid)
+			if err != nil {
+				return fmt.Errorf("could not find referenced message: %w", err)
+			}
+
+			from = msg.From
+			nonce = msg.Nonce
+		case 2:
+			f, err := address.NewFromString(cctx.Args().Get(0))
+			if err != nil {
+				return err
+			}
+
+			n, err := strconv.ParseUint(cctx.Args().Get(1), 10, 64)
+			if err != nil {
+				return err
+			}
+
+			from = f
+			nonce = n
+		default:
+			return cli.ShowCommandHelp(cctx, cctx.Command.Name)
+		}
 
 		ts, err := api.ChainHead(ctx)
 		if err != nil {
@@ -308,15 +449,49 @@ var mpoolReplaceCmd = &cli.Command{
 
 		msg := found.Message
 
-		msg.GasLimit = cctx.Int64("gas-limit")
-		msg.GasPremium, err = types.BigFromString(cctx.String("gas-premium"))
-		if err != nil {
-			return fmt.Errorf("parsing gas-premium: %w", err)
-		}
-		// TODO: estiamte fee cap here
-		msg.GasFeeCap, err = types.BigFromString(cctx.String("gas-feecap"))
-		if err != nil {
-			return fmt.Errorf("parsing gas-feecap: %w", err)
+		if cctx.Bool("auto") {
+			minRBF := messagepool.ComputeMinRBF(msg.GasPremium)
+
+			var mss *lapi.MessageSendSpec
+			if cctx.IsSet("max-fee") {
+				maxFee, err := types.BigFromString(cctx.String("max-fee"))
+				if err != nil {
+					return fmt.Errorf("parsing max-spend: %w", err)
+				}
+				mss = &lapi.MessageSendSpec{
+					MaxFee: maxFee,
+				}
+			}
+
+			// msg.GasLimit = 0 // TODO: need to fix the way we estimate gas limits to account for the messages already being in the mempool
+			msg.GasFeeCap = abi.NewTokenAmount(0)
+			msg.GasPremium = abi.NewTokenAmount(0)
+			retm, err := api.GasEstimateMessageGas(ctx, &msg, mss, types.EmptyTSK)
+			if err != nil {
+				return fmt.Errorf("failed to estimate gas values: %w", err)
+			}
+
+			msg.GasPremium = big.Max(retm.GasPremium, minRBF)
+			msg.GasFeeCap = big.Max(retm.GasFeeCap, msg.GasPremium)
+
+			mff := func() (abi.TokenAmount, error) {
+				return abi.TokenAmount(config.DefaultDefaultMaxFee), nil
+			}
+
+			messagepool.CapGasFee(mff, &msg, mss)
+		} else {
+			if cctx.IsSet("gas-limit") {
+				msg.GasLimit = cctx.Int64("gas-limit")
+			}
+			msg.GasPremium, err = types.BigFromString(cctx.String("gas-premium"))
+			if err != nil {
+				return fmt.Errorf("parsing gas-premium: %w", err)
+			}
+			// TODO: estimate fee cap here
+			msg.GasFeeCap, err = types.BigFromString(cctx.String("gas-feecap"))
+			if err != nil {
+				return fmt.Errorf("parsing gas-feecap: %w", err)
+			}
 		}
 
 		smsg, err := api.WalletSignMessage(ctx, msg.From, &msg)
@@ -456,6 +631,89 @@ var mpoolConfig = &cli.Command{
 			}
 
 			return api.MpoolSetConfig(ctx, cfg)
+		}
+
+		return nil
+	},
+}
+
+var mpoolGasPerfCmd = &cli.Command{
+	Name:  "gas-perf",
+	Usage: "Check gas performance of messages in mempool",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "all",
+			Usage: "print gas performance for all mempool messages (default only prints for local)",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := ReqContext(cctx)
+
+		msgs, err := api.MpoolPending(ctx, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		var filter map[address.Address]struct{}
+		if !cctx.Bool("all") {
+			filter = map[address.Address]struct{}{}
+
+			addrss, err := api.WalletList(ctx)
+			if err != nil {
+				return xerrors.Errorf("getting local addresses: %w", err)
+			}
+
+			for _, a := range addrss {
+				filter[a] = struct{}{}
+			}
+
+			var filtered []*types.SignedMessage
+			for _, msg := range msgs {
+				if _, has := filter[msg.Message.From]; !has {
+					continue
+				}
+				filtered = append(filtered, msg)
+			}
+			msgs = filtered
+		}
+
+		ts, err := api.ChainHead(ctx)
+		if err != nil {
+			return xerrors.Errorf("failed to get chain head: %w", err)
+		}
+
+		baseFee := ts.Blocks()[0].ParentBaseFee
+
+		bigBlockGasLimit := big.NewInt(build.BlockGasLimit)
+
+		getGasReward := func(msg *types.SignedMessage) big.Int {
+			maxPremium := types.BigSub(msg.Message.GasFeeCap, baseFee)
+			if types.BigCmp(maxPremium, msg.Message.GasPremium) < 0 {
+				maxPremium = msg.Message.GasPremium
+			}
+			return types.BigMul(maxPremium, types.NewInt(uint64(msg.Message.GasLimit)))
+		}
+
+		getGasPerf := func(gasReward big.Int, gasLimit int64) float64 {
+			// gasPerf = gasReward * build.BlockGasLimit / gasLimit
+			a := new(stdbig.Rat).SetInt(new(stdbig.Int).Mul(gasReward.Int, bigBlockGasLimit.Int))
+			b := stdbig.NewRat(1, gasLimit)
+			c := new(stdbig.Rat).Mul(a, b)
+			r, _ := c.Float64()
+			return r
+		}
+
+		for _, m := range msgs {
+			gasReward := getGasReward(m)
+			gasPerf := getGasPerf(gasReward, m.Message.GasLimit)
+
+			fmt.Printf("%s\t%d\t%s\t%f\n", m.Message.From, m.Message.Nonce, gasReward, gasPerf)
 		}
 
 		return nil

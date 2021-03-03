@@ -10,7 +10,10 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 	"go.opencensus.io/stats"
 	"go.uber.org/fx"
+	"go.uber.org/multierr"
+	"golang.org/x/xerrors"
 
+	"github.com/libp2p/go-libp2p-core/event"
 	host "github.com/libp2p/go-libp2p-core/host"
 	net "github.com/libp2p/go-libp2p-core/network"
 	peer "github.com/libp2p/go-libp2p-core/peer"
@@ -51,11 +54,24 @@ type PeerMgr struct {
 	dht *dht.IpfsDHT
 
 	notifee *net.NotifyBundle
+	emitter event.Emitter
 
 	done chan struct{}
 }
 
-func NewPeerMgr(lc fx.Lifecycle, h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) *PeerMgr {
+type FilPeerEvt struct {
+	Type FilPeerEvtType
+	ID   peer.ID
+}
+
+type FilPeerEvtType int
+
+const (
+	AddFilPeerEvt FilPeerEvtType = iota
+	RemoveFilPeerEvt
+)
+
+func NewPeerMgr(lc fx.Lifecycle, h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) (*PeerMgr, error) {
 	pm := &PeerMgr{
 		h:             h,
 		dht:           dht,
@@ -69,10 +85,18 @@ func NewPeerMgr(lc fx.Lifecycle, h host.Host, dht *dht.IpfsDHT, bootstrap dtypes
 
 		done: make(chan struct{}),
 	}
+	emitter, err := h.EventBus().Emitter(new(FilPeerEvt))
+	if err != nil {
+		return nil, xerrors.Errorf("creating FilPeerEvt emitter: %w", err)
+	}
+	pm.emitter = emitter
 
 	lc.Append(fx.Hook{
 		OnStop: func(ctx context.Context) error {
-			return pm.Stop(ctx)
+			return multierr.Combine(
+				pm.emitter.Close(),
+				pm.Stop(ctx),
+			)
 		},
 	})
 
@@ -84,10 +108,11 @@ func NewPeerMgr(lc fx.Lifecycle, h host.Host, dht *dht.IpfsDHT, bootstrap dtypes
 
 	h.Network().Notify(pm.notifee)
 
-	return pm
+	return pm, nil
 }
 
 func (pmgr *PeerMgr) AddFilecoinPeer(p peer.ID) {
+	_ = pmgr.emitter.Emit(FilPeerEvt{Type: AddFilPeerEvt, ID: p}) //nolint:errcheck
 	pmgr.peersLk.Lock()
 	defer pmgr.peersLk.Unlock()
 	pmgr.peers[p] = time.Duration(0)
@@ -110,10 +135,19 @@ func (pmgr *PeerMgr) SetPeerLatency(p peer.ID, latency time.Duration) {
 }
 
 func (pmgr *PeerMgr) Disconnect(p peer.ID) {
+	disconnected := false
+
 	if pmgr.h.Network().Connectedness(p) == net.NotConnected {
 		pmgr.peersLk.Lock()
-		defer pmgr.peersLk.Unlock()
-		delete(pmgr.peers, p)
+		_, disconnected = pmgr.peers[p]
+		if disconnected {
+			delete(pmgr.peers, p)
+		}
+		pmgr.peersLk.Unlock()
+	}
+
+	if disconnected {
+		_ = pmgr.emitter.Emit(FilPeerEvt{Type: RemoveFilPeerEvt, ID: p}) //nolint:errcheck
 	}
 }
 
@@ -174,11 +208,17 @@ func (pmgr *PeerMgr) doExpand(ctx context.Context) {
 		}
 
 		log.Info("connecting to bootstrap peers")
+		wg := sync.WaitGroup{}
 		for _, bsp := range pmgr.bootstrappers {
-			if err := pmgr.h.Connect(ctx, bsp); err != nil {
-				log.Warnf("failed to connect to bootstrap peer: %s", err)
-			}
+			wg.Add(1)
+			go func(bsp peer.AddrInfo) {
+				defer wg.Done()
+				if err := pmgr.h.Connect(ctx, bsp); err != nil {
+					log.Warnf("failed to connect to bootstrap peer: %s", err)
+				}
+			}(bsp)
 		}
+		wg.Wait()
 		return
 	}
 

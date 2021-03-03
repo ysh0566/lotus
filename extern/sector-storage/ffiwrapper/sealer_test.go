@@ -15,6 +15,10 @@ import (
 	"testing"
 	"time"
 
+	commpffi "github.com/filecoin-project/go-commp-utils/ffiwrapper"
+
+	proof2 "github.com/filecoin-project/specs-actors/v2/actors/runtime/proof"
+
 	"github.com/ipfs/go-cid"
 
 	logging "github.com/ipfs/go-log"
@@ -22,13 +26,14 @@ import (
 	"golang.org/x/xerrors"
 
 	paramfetch "github.com/filecoin-project/go-paramfetch"
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/specs-storage/storage"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
 
 	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper/basicfs"
-	"github.com/filecoin-project/lotus/extern/sector-storage/stores"
+	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
+	"github.com/filecoin-project/lotus/extern/storage-sealing/lib/nullreader"
 )
 
 func init() {
@@ -41,7 +46,7 @@ var sectorSize, _ = sealProofType.SectorSize()
 var sealRand = abi.SealRandomness{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2}
 
 type seal struct {
-	id     abi.SectorID
+	ref    storage.SectorRef
 	cids   storage.SectorCids
 	pi     abi.PieceInfo
 	ticket abi.SealRandomness
@@ -54,12 +59,12 @@ func data(sn abi.SectorNumber, dlen abi.UnpaddedPieceSize) io.Reader {
 	)
 }
 
-func (s *seal) precommit(t *testing.T, sb *Sealer, id abi.SectorID, done func()) {
+func (s *seal) precommit(t *testing.T, sb *Sealer, id storage.SectorRef, done func()) {
 	defer done()
 	dlen := abi.PaddedPieceSize(sectorSize).Unpadded()
 
 	var err error
-	r := data(id.Number, dlen)
+	r := data(id.ID.Number, dlen)
 	s.pi, err = sb.AddPiece(context.TODO(), id, []abi.UnpaddedPieceSize{}, dlen, r)
 	if err != nil {
 		t.Fatalf("%+v", err)
@@ -82,19 +87,19 @@ func (s *seal) commit(t *testing.T, sb *Sealer, done func()) {
 	defer done()
 	seed := abi.InteractiveSealRandomness{0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 45, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9}
 
-	pc1, err := sb.SealCommit1(context.TODO(), s.id, s.ticket, seed, []abi.PieceInfo{s.pi}, s.cids)
+	pc1, err := sb.SealCommit1(context.TODO(), s.ref, s.ticket, seed, []abi.PieceInfo{s.pi}, s.cids)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
-	proof, err := sb.SealCommit2(context.TODO(), s.id, pc1)
+	proof, err := sb.SealCommit2(context.TODO(), s.ref, pc1)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	ok, err := ProofVerifier.VerifySeal(abi.SealVerifyInfo{
-		SectorID:              s.id,
+	ok, err := ProofVerifier.VerifySeal(proof2.SealVerifyInfo{
+		SectorID:              s.ref.ID,
 		SealedCID:             s.cids.Sealed,
-		SealProof:             sealProofType,
+		SealProof:             s.ref.ProofType,
 		Proof:                 proof,
 		Randomness:            s.ticket,
 		InteractiveRandomness: seed,
@@ -109,7 +114,7 @@ func (s *seal) commit(t *testing.T, sb *Sealer, done func()) {
 	}
 }
 
-func (s *seal) unseal(t *testing.T, sb *Sealer, sp *basicfs.Provider, si abi.SectorID, done func()) {
+func (s *seal) unseal(t *testing.T, sb *Sealer, sp *basicfs.Provider, si storage.SectorRef, done func()) {
 	defer done()
 
 	var b bytes.Buffer
@@ -118,12 +123,12 @@ func (s *seal) unseal(t *testing.T, sb *Sealer, sp *basicfs.Provider, si abi.Sec
 		t.Fatal(err)
 	}
 
-	expect, _ := ioutil.ReadAll(data(si.Number, 1016))
+	expect, _ := ioutil.ReadAll(data(si.ID.Number, 1016))
 	if !bytes.Equal(b.Bytes(), expect) {
 		t.Fatal("read wrong bytes")
 	}
 
-	p, sd, err := sp.AcquireSector(context.TODO(), si, stores.FTUnsealed, stores.FTNone, stores.PathStorage)
+	p, sd, err := sp.AcquireSector(context.TODO(), si, storiface.FTUnsealed, storiface.FTNone, storiface.PathStorage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +153,7 @@ func (s *seal) unseal(t *testing.T, sb *Sealer, sp *basicfs.Provider, si abi.Sec
 		t.Fatal(err)
 	}
 
-	expect, _ = ioutil.ReadAll(data(si.Number, 1016))
+	expect, _ = ioutil.ReadAll(data(si.ID.Number, 1016))
 	require.Equal(t, expect, b.Bytes())
 
 	b.Reset()
@@ -166,50 +171,34 @@ func (s *seal) unseal(t *testing.T, sb *Sealer, sp *basicfs.Provider, si abi.Sec
 	}
 }
 
-func post(t *testing.T, sealer *Sealer, seals ...seal) time.Time {
-	/*randomness := abi.PoStRandomness{0, 9, 2, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 45, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 7}
+func post(t *testing.T, sealer *Sealer, skipped []abi.SectorID, seals ...seal) {
+	randomness := abi.PoStRandomness{0, 9, 2, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 45, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 7}
 
-	sis := make([]abi.SectorInfo, len(seals))
+	sis := make([]proof2.SectorInfo, len(seals))
 	for i, s := range seals {
-		sis[i] = abi.SectorInfo{
-			RegisteredProof: sealProofType,
-			SectorNumber:    s.id.Number,
-			SealedCID:       s.cids.Sealed,
+		sis[i] = proof2.SectorInfo{
+			SealProof:    s.ref.ProofType,
+			SectorNumber: s.ref.ID.Number,
+			SealedCID:    s.cids.Sealed,
 		}
 	}
 
-	candidates, err := sealer.GenerateEPostCandidates(context.TODO(), seals[0].id.Miner, sis, randomness, []abi.SectorNumber{})
-	if err != nil {
-		t.Fatalf("%+v", err)
-	}*/
-
-	fmt.Println("skipping post")
-
-	genCandidates := time.Now()
-
-	/*if len(candidates) != 1 {
-		t.Fatal("expected 1 candidate")
+	proofs, skp, err := sealer.GenerateWindowPoSt(context.TODO(), seals[0].ref.ID.Miner, sis, randomness)
+	if len(skipped) > 0 {
+		require.Error(t, err)
+		require.EqualValues(t, skipped, skp)
+		return
 	}
 
-	candidatesPrime := make([]abi.PoStCandidate, len(candidates))
-	for idx := range candidatesPrime {
-		candidatesPrime[idx] = candidates[idx].Candidate
-	}
-
-	proofs, err := sealer.ComputeElectionPoSt(context.TODO(), seals[0].id.Miner, sis, randomness, candidatesPrime)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	ePoStChallengeCount := ElectionPostChallengeCount(uint64(len(sis)), 0)
-
-	ok, err := ProofVerifier.VerifyElectionPost(context.TODO(), abi.PoStVerifyInfo{
-		Randomness:      randomness,
-		Candidates:      candidatesPrime,
-		Proofs:          proofs,
-		EligibleSectors: sis,
-		Prover:          seals[0].id.Miner,
-		ChallengeCount:  ePoStChallengeCount,
+	ok, err := ProofVerifier.VerifyWindowPoSt(context.TODO(), proof2.WindowPoStVerifyInfo{
+		Randomness:        randomness,
+		Proofs:            proofs,
+		ChallengedSectors: sis,
+		Prover:            seals[0].ref.ID.Miner,
 	})
 	if err != nil {
 		t.Fatalf("%+v", err)
@@ -217,8 +206,21 @@ func post(t *testing.T, sealer *Sealer, seals ...seal) time.Time {
 	if !ok {
 		t.Fatal("bad post")
 	}
-	*/
-	return genCandidates
+}
+
+func corrupt(t *testing.T, sealer *Sealer, id storage.SectorRef) {
+	paths, done, err := sealer.sectors.AcquireSector(context.Background(), id, storiface.FTSealed, 0, storiface.PathStorage)
+	require.NoError(t, err)
+	defer done()
+
+	log.Infof("corrupt %s", paths.Sealed)
+	f, err := os.OpenFile(paths.Sealed, os.O_RDWR, 0664)
+	require.NoError(t, err)
+
+	_, err = f.WriteAt(bytes.Repeat([]byte{'d'}, 2048), 0)
+	require.NoError(t, err)
+
+	require.NoError(t, f.Close())
 }
 
 func getGrothParamFileAndVerifyingKeys(s abi.SectorSize) {
@@ -246,6 +248,10 @@ func TestDownloadParams(t *testing.T) {
 }
 
 func TestSealAndVerify(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	defer requireFDsClosed(t, openFDs(t))
 
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
@@ -261,14 +267,10 @@ func TestSealAndVerify(t *testing.T) {
 	}
 	miner := abi.ActorID(123)
 
-	cfg := &Config{
-		SealProofType: sealProofType,
-	}
-
 	sp := &basicfs.Provider{
 		Root: cdir,
 	}
-	sb, err := New(sp, cfg)
+	sb, err := New(sp)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -283,9 +285,12 @@ func TestSealAndVerify(t *testing.T) {
 	}
 	defer cleanup()
 
-	si := abi.SectorID{Miner: miner, Number: 1}
+	si := storage.SectorRef{
+		ID:        abi.SectorID{Miner: miner, Number: 1},
+		ProofType: sealProofType,
+	}
 
-	s := seal{id: si}
+	s := seal{ref: si}
 
 	start := time.Now()
 
@@ -297,11 +302,11 @@ func TestSealAndVerify(t *testing.T) {
 
 	commit := time.Now()
 
-	genCandidiates := post(t, sb, s)
+	post(t, sb, nil, s)
 
 	epost := time.Now()
 
-	post(t, sb, s)
+	post(t, sb, nil, s)
 
 	if err := sb.FinalizeSector(context.TODO(), si, nil); err != nil {
 		t.Fatalf("%+v", err)
@@ -311,11 +316,14 @@ func TestSealAndVerify(t *testing.T) {
 
 	fmt.Printf("PreCommit: %s\n", precommit.Sub(start).String())
 	fmt.Printf("Commit: %s\n", commit.Sub(precommit).String())
-	fmt.Printf("GenCandidates: %s\n", genCandidiates.Sub(commit).String())
-	fmt.Printf("EPoSt: %s\n", epost.Sub(genCandidiates).String())
+	fmt.Printf("EPoSt: %s\n", epost.Sub(commit).String())
 }
 
 func TestSealPoStNoCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	defer requireFDsClosed(t, openFDs(t))
 
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
@@ -332,13 +340,10 @@ func TestSealPoStNoCommit(t *testing.T) {
 
 	miner := abi.ActorID(123)
 
-	cfg := &Config{
-		SealProofType: sealProofType,
-	}
 	sp := &basicfs.Provider{
 		Root: dir,
 	}
-	sb, err := New(sp, cfg)
+	sb, err := New(sp)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -354,9 +359,12 @@ func TestSealPoStNoCommit(t *testing.T) {
 	}
 	defer cleanup()
 
-	si := abi.SectorID{Miner: miner, Number: 1}
+	si := storage.SectorRef{
+		ID:        abi.SectorID{Miner: miner, Number: 1},
+		ProofType: sealProofType,
+	}
 
-	s := seal{id: si}
+	s := seal{ref: si}
 
 	start := time.Now()
 
@@ -368,16 +376,19 @@ func TestSealPoStNoCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	genCandidiates := post(t, sb, s)
+	post(t, sb, nil, s)
 
 	epost := time.Now()
 
 	fmt.Printf("PreCommit: %s\n", precommit.Sub(start).String())
-	fmt.Printf("GenCandidates: %s\n", genCandidiates.Sub(precommit).String())
-	fmt.Printf("EPoSt: %s\n", epost.Sub(genCandidiates).String())
+	fmt.Printf("EPoSt: %s\n", epost.Sub(precommit).String())
 }
 
-func TestSealAndVerify2(t *testing.T) {
+func TestSealAndVerify3(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	defer requireFDsClosed(t, openFDs(t))
 
 	if runtime.NumCPU() < 10 && os.Getenv("CI") == "" { // don't bother on slow hardware
@@ -394,13 +405,10 @@ func TestSealAndVerify2(t *testing.T) {
 
 	miner := abi.ActorID(123)
 
-	cfg := &Config{
-		SealProofType: sealProofType,
-	}
 	sp := &basicfs.Provider{
 		Root: dir,
 	}
-	sb, err := New(sp, cfg)
+	sb, err := New(sp)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -415,24 +423,43 @@ func TestSealAndVerify2(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	si1 := abi.SectorID{Miner: miner, Number: 1}
-	si2 := abi.SectorID{Miner: miner, Number: 2}
+	si1 := storage.SectorRef{
+		ID:        abi.SectorID{Miner: miner, Number: 1},
+		ProofType: sealProofType,
+	}
+	si2 := storage.SectorRef{
+		ID:        abi.SectorID{Miner: miner, Number: 2},
+		ProofType: sealProofType,
+	}
+	si3 := storage.SectorRef{
+		ID:        abi.SectorID{Miner: miner, Number: 3},
+		ProofType: sealProofType,
+	}
 
-	s1 := seal{id: si1}
-	s2 := seal{id: si2}
+	s1 := seal{ref: si1}
+	s2 := seal{ref: si2}
+	s3 := seal{ref: si3}
 
-	wg.Add(2)
+	wg.Add(3)
 	go s1.precommit(t, sb, si1, wg.Done) //nolint: staticcheck
 	time.Sleep(100 * time.Millisecond)
 	go s2.precommit(t, sb, si2, wg.Done) //nolint: staticcheck
+	time.Sleep(100 * time.Millisecond)
+	go s3.precommit(t, sb, si3, wg.Done) //nolint: staticcheck
 	wg.Wait()
 
-	wg.Add(2)
+	wg.Add(3)
 	go s1.commit(t, sb, wg.Done) //nolint: staticcheck
 	go s2.commit(t, sb, wg.Done) //nolint: staticcheck
+	go s3.commit(t, sb, wg.Done) //nolint: staticcheck
 	wg.Wait()
 
-	post(t, sb, s1, s2)
+	post(t, sb, nil, s1, s2, s3)
+
+	corrupt(t, sb, si1)
+	corrupt(t, sb, si2)
+
+	post(t, sb, []abi.SectorID{si1.ID, si2.ID}, s1, s2, s3)
 }
 
 func BenchmarkWriteWithAlignment(b *testing.B) {
@@ -441,7 +468,7 @@ func BenchmarkWriteWithAlignment(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		rf, w, _ := ToReadableFile(bytes.NewReader(bytes.Repeat([]byte{0xff, 0}, int(bt/2))), int64(bt))
+		rf, w, _ := commpffi.ToReadableFile(bytes.NewReader(bytes.Repeat([]byte{0xff, 0}, int(bt/2))), int64(bt))
 		tf, _ := ioutil.TempFile("/tmp/", "scrb-")
 		b.StartTimer()
 
@@ -500,7 +527,7 @@ func TestGenerateUnsealedCID(t *testing.T) {
 	ups := int(abi.PaddedPieceSize(2048).Unpadded())
 
 	commP := func(b []byte) cid.Cid {
-		pf, werr, err := ToReadableFile(bytes.NewReader(b), int64(len(b)))
+		pf, werr, err := commpffi.ToReadableFile(bytes.NewReader(b), int64(len(b)))
 		require.NoError(t, err)
 
 		c, err := ffi.GeneratePieceCIDFromFile(pt, pf, abi.UnpaddedPieceSize(len(b)))
@@ -595,4 +622,90 @@ func TestGenerateUnsealedCID(t *testing.T) {
 		[][]byte{barr(1, 16), barr(2, 8), barr(3, 16), barr(4, 4), barr(5, 16)},
 		[][]byte{barr(1, 16), barr(0, 16), barr(2, 8), barr(3, 16), barr(0, 16), barr(0, 8), barr(4, 4), barr(5, 16), barr(0, 16), barr(0, 8)},
 	)
+}
+
+func TestAddPiece512M(t *testing.T) {
+	sz := abi.PaddedPieceSize(512 << 20).Unpadded()
+
+	cdir, err := ioutil.TempDir("", "sbtest-c-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	miner := abi.ActorID(123)
+
+	sp := &basicfs.Provider{
+		Root: cdir,
+	}
+	sb, err := New(sp)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	cleanup := func() {
+		if t.Failed() {
+			fmt.Printf("not removing %s\n", cdir)
+			return
+		}
+		if err := os.RemoveAll(cdir); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(cleanup)
+
+	r := rand.New(rand.NewSource(0x7e5))
+
+	c, err := sb.AddPiece(context.TODO(), storage.SectorRef{
+		ID: abi.SectorID{
+			Miner:  miner,
+			Number: 0,
+		},
+		ProofType: abi.RegisteredSealProof_StackedDrg512MiBV1_1,
+	}, nil, sz, io.LimitReader(r, int64(sz)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	require.Equal(t, "baga6ea4seaqhyticusemlcrjhvulpfng4nint6bu3wpe5s3x4bnuj2rs47hfacy", c.PieceCID.String())
+}
+
+func BenchmarkAddPiece512M(b *testing.B) {
+	sz := abi.PaddedPieceSize(512 << 20).Unpadded()
+	b.SetBytes(int64(sz))
+
+	cdir, err := ioutil.TempDir("", "sbtest-c-")
+	if err != nil {
+		b.Fatal(err)
+	}
+	miner := abi.ActorID(123)
+
+	sp := &basicfs.Provider{
+		Root: cdir,
+	}
+	sb, err := New(sp)
+	if err != nil {
+		b.Fatalf("%+v", err)
+	}
+	cleanup := func() {
+		if b.Failed() {
+			fmt.Printf("not removing %s\n", cdir)
+			return
+		}
+		if err := os.RemoveAll(cdir); err != nil {
+			b.Error(err)
+		}
+	}
+	b.Cleanup(cleanup)
+
+	for i := 0; i < b.N; i++ {
+		c, err := sb.AddPiece(context.TODO(), storage.SectorRef{
+			ID: abi.SectorID{
+				Miner:  miner,
+				Number: abi.SectorNumber(i),
+			},
+			ProofType: abi.RegisteredSealProof_StackedDrg512MiBV1_1,
+		}, nil, sz, io.LimitReader(&nullreader.Reader{}, int64(sz)))
+		if err != nil {
+			b.Fatal(err)
+		}
+		fmt.Println(c)
+	}
 }

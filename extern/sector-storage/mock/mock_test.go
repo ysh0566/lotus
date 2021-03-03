@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 )
 
 func TestOpFinish(t *testing.T) {
-	sb := NewMockSectorMgr(2048, nil)
+	sb := NewMockSectorMgr(nil)
 
-	sid, pieces, err := sb.StageFakeData(123)
+	sid, pieces, err := sb.StageFakeData(123, abi.RegisteredSealProof_StackedDrg2KiBV1_1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package messagepool
 
 import (
 	"context"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -9,14 +10,21 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/lotus/chain/stmgr"
+	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
+)
+
+var (
+	HeadChangeCoalesceMinDelay      = 2 * time.Second
+	HeadChangeCoalesceMaxDelay      = 6 * time.Second
+	HeadChangeCoalesceMergeInterval = time.Second
 )
 
 type Provider interface {
 	SubscribeHeadChanges(func(rev, app []*types.TipSet) error) *types.TipSet
 	PutMessage(m types.ChainMsg) (cid.Cid, error)
 	PubSubPublish(string, []byte) error
-	StateGetActor(address.Address, *types.TipSet) (*types.Actor, error)
+	GetActorAfter(address.Address, *types.TipSet) (*types.Actor, error)
 	StateAccountKey(context.Context, address.Address, *types.TipSet) (address.Address, error)
 	MessagesForBlock(*types.BlockHeader) ([]*types.Message, []*types.SignedMessage, error)
 	MessagesForTipset(*types.TipSet) ([]types.ChainMsg, error)
@@ -34,7 +42,13 @@ func NewProvider(sm *stmgr.StateManager, ps *pubsub.PubSub) Provider {
 }
 
 func (mpp *mpoolProvider) SubscribeHeadChanges(cb func(rev, app []*types.TipSet) error) *types.TipSet {
-	mpp.sm.ChainStore().SubscribeHeadChanges(cb)
+	mpp.sm.ChainStore().SubscribeHeadChanges(
+		store.WrapHeadChangeCoalescer(
+			cb,
+			HeadChangeCoalesceMinDelay,
+			HeadChangeCoalesceMaxDelay,
+			HeadChangeCoalesceMergeInterval,
+		))
 	return mpp.sm.ChainStore().GetHeaviestTipSet()
 }
 
@@ -43,12 +57,19 @@ func (mpp *mpoolProvider) PutMessage(m types.ChainMsg) (cid.Cid, error) {
 }
 
 func (mpp *mpoolProvider) PubSubPublish(k string, v []byte) error {
-	return mpp.ps.Publish(k, v)
+	return mpp.ps.Publish(k, v) //nolint
 }
 
-func (mpp *mpoolProvider) StateGetActor(addr address.Address, ts *types.TipSet) (*types.Actor, error) {
-	var act types.Actor
-	return &act, mpp.sm.WithParentState(ts, mpp.sm.WithActor(addr, stmgr.GetActor(&act)))
+func (mpp *mpoolProvider) GetActorAfter(addr address.Address, ts *types.TipSet) (*types.Actor, error) {
+	stcid, _, err := mpp.sm.TipSetState(context.TODO(), ts)
+	if err != nil {
+		return nil, xerrors.Errorf("computing tipset state for GetActor: %w", err)
+	}
+	st, err := mpp.sm.StateTree(stcid)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to load state tree: %w", err)
+	}
+	return st.GetActor(addr)
 }
 
 func (mpp *mpoolProvider) StateAccountKey(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {

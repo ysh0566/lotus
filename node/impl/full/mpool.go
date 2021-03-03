@@ -2,30 +2,44 @@ package full
 
 import (
 	"context"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
+	"encoding/json"
 
+	"github.com/filecoin-project/go-address"
 	"github.com/ipfs/go-cid"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/messagepool"
-	"github.com/filecoin-project/lotus/chain/store"
+	"github.com/filecoin-project/lotus/chain/messagesigner"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
+type MpoolModuleAPI interface {
+	MpoolPush(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error)
+}
+
+// MpoolModule provides a default implementation of MpoolModuleAPI.
+// It can be swapped out with another implementation through Dependency
+// Injection (for example with a thin RPC client).
+type MpoolModule struct {
+	fx.In
+
+	Mpool *messagepool.MessagePool
+}
+
+var _ MpoolModuleAPI = (*MpoolModule)(nil)
+
 type MpoolAPI struct {
 	fx.In
+
+	MpoolModuleAPI
 
 	WalletAPI
 	GasAPI
 
-	Chain *store.ChainStore
-
-	Mpool *messagepool.MessagePool
+	MessageSigner *messagesigner.MessageSigner
 
 	PushLocks *dtypes.MpoolLocker
 }
@@ -105,37 +119,28 @@ func (a *MpoolAPI) MpoolPending(ctx context.Context, tsk types.TipSetKey) ([]*ty
 	}
 }
 
-func (a *MpoolAPI) MpoolPush(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error) {
-	return a.Mpool.Push(smsg)
+func (a *MpoolAPI) MpoolClear(ctx context.Context, local bool) error {
+	a.Mpool.Clear(local)
+	return nil
 }
 
-func capGasFee(msg *types.Message, maxFee abi.TokenAmount) {
-	if maxFee.Equals(big.Zero()) {
-		return
-	}
+func (m *MpoolModule) MpoolPush(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error) {
+	return m.Mpool.Push(smsg)
+}
 
-	gl := types.NewInt(uint64(msg.GasLimit))
-	totalFee := types.BigMul(msg.GasFeeCap, gl)
-	minerFee := types.BigMul(msg.GasPremium, gl)
-
-	if totalFee.LessThanEqual(maxFee) {
-		return
-	}
-
-	// scale chain/miner fee down proportionally to fit in our budget
-	// TODO: there are probably smarter things we can do here to optimize
-	//  message inclusion latency
-
-	msg.GasFeeCap = big.Div(maxFee, gl)
-	msg.GasPremium = big.Div(big.Div(big.Mul(minerFee, maxFee), totalFee), gl)
+func (a *MpoolAPI) MpoolPushUntrusted(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error) {
+	return a.Mpool.PushUntrusted(smsg)
 }
 
 func (a *MpoolAPI) MpoolPushMessage(ctx context.Context, msg *types.Message, spec *api.MessageSendSpec) (*types.SignedMessage, error) {
+	cp := *msg
+	msg = &cp
+	inMsg := *msg
+	fromA, err := a.Stmgr.ResolveToKeyAddress(ctx, msg.From, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("getting key address: %w", err)
+	}
 	{
-		fromA, err := a.Stmgr.ResolveToKeyAddress(ctx, msg.From, nil)
-		if err != nil {
-			return nil, xerrors.Errorf("getting key address: %w", err)
-		}
 		done, err := a.PushLocks.TakeLock(ctx, fromA)
 		if err != nil {
 			return nil, xerrors.Errorf("taking lock: %w", err)
@@ -146,60 +151,76 @@ func (a *MpoolAPI) MpoolPushMessage(ctx context.Context, msg *types.Message, spe
 	if msg.Nonce != 0 {
 		return nil, xerrors.Errorf("MpoolPushMessage expects message nonce to be 0, was %d", msg.Nonce)
 	}
-	if msg.GasLimit == 0 {
-		gasLimit, err := a.GasEstimateGasLimit(ctx, msg, types.TipSetKey{})
+
+	msg, err = a.GasAPI.GasEstimateMessageGas(ctx, msg, spec, types.EmptyTSK)
+	if err != nil {
+		return nil, xerrors.Errorf("GasEstimateMessageGas error: %w", err)
+	}
+
+	if msg.GasPremium.GreaterThan(msg.GasFeeCap) {
+		inJson, _ := json.Marshal(inMsg)
+		outJson, _ := json.Marshal(msg)
+		return nil, xerrors.Errorf("After estimation, GasPremium is greater than GasFeeCap, inmsg: %s, outmsg: %s",
+			inJson, outJson)
+	}
+
+	if msg.From.Protocol() == address.ID {
+		log.Warnf("Push from ID address (%s), adjusting to %s", msg.From, fromA)
+		msg.From = fromA
+	}
+
+	b, err := a.WalletBalance(ctx, msg.From)
+	if err != nil {
+		return nil, xerrors.Errorf("mpool push: getting origin balance: %w", err)
+	}
+
+	if b.LessThan(msg.Value) {
+		return nil, xerrors.Errorf("mpool push: not enough funds: %s < %s", b, msg.Value)
+	}
+
+	// Sign and push the message
+	return a.MessageSigner.SignMessage(ctx, msg, func(smsg *types.SignedMessage) error {
+		if _, err := a.MpoolModuleAPI.MpoolPush(ctx, smsg); err != nil {
+			return xerrors.Errorf("mpool push: failed to push message: %w", err)
+		}
+		return nil
+	})
+}
+
+func (a *MpoolAPI) MpoolBatchPush(ctx context.Context, smsgs []*types.SignedMessage) ([]cid.Cid, error) {
+	var messageCids []cid.Cid
+	for _, smsg := range smsgs {
+		smsgCid, err := a.Mpool.Push(smsg)
 		if err != nil {
-			return nil, xerrors.Errorf("estimating gas used: %w", err)
+			return messageCids, err
 		}
-		msg.GasLimit = int64(float64(gasLimit) * a.Mpool.GetConfig().GasLimitOverestimation)
+		messageCids = append(messageCids, smsgCid)
 	}
+	return messageCids, nil
+}
 
-	if msg.GasPremium == types.EmptyInt || types.BigCmp(msg.GasPremium, types.NewInt(0)) == 0 {
-		gasPremium, err := a.GasEstimateGasPremium(ctx, 2, msg.From, msg.GasLimit, types.TipSetKey{})
+func (a *MpoolAPI) MpoolBatchPushUntrusted(ctx context.Context, smsgs []*types.SignedMessage) ([]cid.Cid, error) {
+	var messageCids []cid.Cid
+	for _, smsg := range smsgs {
+		smsgCid, err := a.Mpool.PushUntrusted(smsg)
 		if err != nil {
-			return nil, xerrors.Errorf("estimating gas price: %w", err)
+			return messageCids, err
 		}
-		msg.GasPremium = gasPremium
+		messageCids = append(messageCids, smsgCid)
 	}
+	return messageCids, nil
+}
 
-	if msg.GasFeeCap == types.EmptyInt || types.BigCmp(msg.GasFeeCap, types.NewInt(0)) == 0 {
-		feeCap, err := a.GasEstimateFeeCap(ctx, msg, 10, types.EmptyTSK)
+func (a *MpoolAPI) MpoolBatchPushMessage(ctx context.Context, msgs []*types.Message, spec *api.MessageSendSpec) ([]*types.SignedMessage, error) {
+	var smsgs []*types.SignedMessage
+	for _, msg := range msgs {
+		smsg, err := a.MpoolPushMessage(ctx, msg, spec)
 		if err != nil {
-			return nil, xerrors.Errorf("estimating fee cap: %w", err)
+			return smsgs, err
 		}
-		msg.GasFeeCap = big.Add(feeCap, msg.GasPremium)
+		smsgs = append(smsgs, smsg)
 	}
-
-	capGasFee(msg, spec.Get().MaxFee)
-
-	sign := func(from address.Address, nonce uint64) (*types.SignedMessage, error) {
-		msg.Nonce = nonce
-		if msg.From.Protocol() == address.ID {
-			log.Warnf("Push from ID address (%s), adjusting to %s", msg.From, from)
-			msg.From = from
-		}
-
-		b, err := a.WalletBalance(ctx, msg.From)
-		if err != nil {
-			return nil, xerrors.Errorf("mpool push: getting origin balance: %w", err)
-		}
-
-		if b.LessThan(msg.Value) {
-			return nil, xerrors.Errorf("mpool push: not enough funds: %s < %s", b, msg.Value)
-		}
-
-		return a.WalletSignMessage(ctx, from, msg)
-	}
-
-	var m *types.SignedMessage
-	var err error
-again:
-	m, err = a.Mpool.PushWithNonce(ctx, msg.From, sign)
-	if err == messagepool.ErrTryAgain {
-		log.Debugf("temporary failure while pushing message: %s; retrying", err)
-		goto again
-	}
-	return m, err
+	return smsgs, nil
 }
 
 func (a *MpoolAPI) MpoolGetNonce(ctx context.Context, addr address.Address) (uint64, error) {

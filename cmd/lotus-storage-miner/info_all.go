@@ -10,6 +10,8 @@ import (
 	lcli "github.com/filecoin-project/lotus/cli"
 )
 
+var _test = false
+
 var infoAllCmd = &cli.Command{
 	Name:  "all",
 	Usage: "dump all related miner info",
@@ -126,14 +128,16 @@ var infoAllCmd = &cli.Command{
 
 			fs := &flag.FlagSet{}
 			for _, f := range sectorsStatusCmd.Flags {
-				f.Apply(fs)
+				if err := f.Apply(fs); err != nil {
+					return err
+				}
 			}
 			if err := fs.Parse([]string{"--log", "--on-chain-info", fmt.Sprint(s)}); err != nil {
 				return err
 			}
 
 			if err := sectorsStatusCmd.Action(cli.NewContext(cctx.App, fs, cctx)); err != nil {
-				return err
+				fmt.Println("ERROR: ", err)
 			}
 
 			fmt.Printf("\n##: Sector %d Storage Location\n", s)
@@ -144,13 +148,15 @@ var infoAllCmd = &cli.Command{
 			}
 
 			if err := storageFindCmd.Action(cli.NewContext(cctx.App, fs, cctx)); err != nil {
-				return err
+				fmt.Println("ERROR: ", err)
 			}
 		}
 
-		fmt.Println("\n#: Goroutines")
-		if err := lcli.PprofGoroutines.Action(cctx); err != nil {
-			return err
+		if !_test {
+			fmt.Println("\n#: Goroutines")
+			if err := lcli.PprofGoroutines.Action(cctx); err != nil {
+				return err
+			}
 		}
 
 		return nil

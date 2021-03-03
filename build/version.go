@@ -1,31 +1,41 @@
 package build
 
-import "fmt"
+import (
+	"fmt"
+
+	"golang.org/x/xerrors"
+)
 
 var CurrentCommit string
 var BuildType int
 
 const (
-	BuildDefault = 0
-	Build2k      = 0x1
-	BuildDebug   = 0x3
+	BuildDefault  = 0
+	BuildMainnet  = 0x1
+	Build2k       = 0x2
+	BuildDebug    = 0x3
+	BuildCalibnet = 0x4
 )
 
 func buildType() string {
 	switch BuildType {
 	case BuildDefault:
 		return ""
-	case BuildDebug:
-		return "+debug"
+	case BuildMainnet:
+		return "+mainnet"
 	case Build2k:
 		return "+2k"
+	case BuildDebug:
+		return "+debug"
+	case BuildCalibnet:
+		return "+calibnet"
 	default:
 		return "+huh?"
 	}
 }
 
 // BuildVersion is the local build version, set by build system
-const BuildVersion = "0.4.6"
+const BuildVersion = "1.5.0"
 
 func UserVersion() string {
 	return BuildVersion + buildType() + CurrentCommit
@@ -52,8 +62,37 @@ func (ve Version) EqMajorMinor(v2 Version) bool {
 	return ve&minorMask == v2&minorMask
 }
 
-// APIVersion is a semver version of the rpc api exposed
-var APIVersion Version = newVer(0, 11, 0)
+type NodeType int
+
+const (
+	NodeUnknown NodeType = iota
+
+	NodeFull
+	NodeMiner
+	NodeWorker
+)
+
+var RunningNodeType NodeType
+
+func VersionForType(nodeType NodeType) (Version, error) {
+	switch nodeType {
+	case NodeFull:
+		return FullAPIVersion, nil
+	case NodeMiner:
+		return MinerAPIVersion, nil
+	case NodeWorker:
+		return WorkerAPIVersion, nil
+	default:
+		return Version(0), xerrors.Errorf("unknown node type %d", nodeType)
+	}
+}
+
+// semver versions of the rpc api exposed
+var (
+	FullAPIVersion   = newVer(1, 1, 0)
+	MinerAPIVersion  = newVer(1, 0, 1)
+	WorkerAPIVersion = newVer(1, 0, 0)
+)
 
 //nolint:varcheck,deadcode
 const (

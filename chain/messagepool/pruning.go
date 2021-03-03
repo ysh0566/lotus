@@ -19,7 +19,8 @@ func (mp *MessagePool) pruneExcessMessages() error {
 	mp.lk.Lock()
 	defer mp.lk.Unlock()
 
-	if mp.currentSize < mp.cfg.SizeLimitHigh {
+	mpCfg := mp.getConfig()
+	if mp.currentSize < mpCfg.SizeLimitHigh {
 		return nil
 	}
 
@@ -27,7 +28,7 @@ func (mp *MessagePool) pruneExcessMessages() error {
 	case <-mp.pruneCooldown:
 		err := mp.pruneMessages(context.TODO(), ts)
 		go func() {
-			time.Sleep(mp.cfg.PruneCooldown)
+			time.Sleep(mpCfg.PruneCooldown)
 			mp.pruneCooldown <- struct{}{}
 		}()
 		return err
@@ -46,13 +47,22 @@ func (mp *MessagePool) pruneMessages(ctx context.Context, ts *types.TipSet) erro
 	if err != nil {
 		return xerrors.Errorf("computing basefee: %w", err)
 	}
+	baseFeeLowerBound := getBaseFeeLowerBound(baseFee, baseFeeLowerBoundFactor)
 
 	pending, _ := mp.getPendingMessages(ts, ts)
 
-	// priority actors -- not pruned
-	priority := make(map[address.Address]struct{})
-	for _, actor := range mp.cfg.PriorityAddrs {
-		priority[actor] = struct{}{}
+	// protected actors -- not pruned
+	protected := make(map[address.Address]struct{})
+
+	mpCfg := mp.getConfig()
+	// we never prune priority addresses
+	for _, actor := range mpCfg.PriorityAddrs {
+		protected[actor] = struct{}{}
+	}
+
+	// we also never prune locally published messages
+	for actor := range mp.localAddrs {
+		protected[actor] = struct{}{}
 	}
 
 	// Collect all messages to track which ones to remove and create chains for block inclusion
@@ -61,18 +71,18 @@ func (mp *MessagePool) pruneMessages(ctx context.Context, ts *types.TipSet) erro
 
 	var chains []*msgChain
 	for actor, mset := range pending {
-		// we never prune priority actors
-		_, keep := priority[actor]
+		// we never prune protected actors
+		_, keep := protected[actor]
 		if keep {
 			keepCount += len(mset)
 			continue
 		}
 
-		// not a priority actor, track the messages and create chains
+		// not a protected actor, track the messages and create chains
 		for _, m := range mset {
 			pruneMsgs[m.Message.Cid()] = m
 		}
-		actorChains := mp.createMessageChains(actor, mset, baseFee, ts)
+		actorChains := mp.createMessageChains(actor, mset, baseFeeLowerBound, ts)
 		chains = append(chains, actorChains...)
 	}
 
@@ -82,7 +92,7 @@ func (mp *MessagePool) pruneMessages(ctx context.Context, ts *types.TipSet) erro
 	})
 
 	// Keep messages (remove them from pruneMsgs) from chains while we are under the low water mark
-	loWaterMark := mp.cfg.SizeLimitLow
+	loWaterMark := mpCfg.SizeLimitLow
 keepLoop:
 	for _, chain := range chains {
 		for _, m := range chain.msgs {
@@ -98,7 +108,7 @@ keepLoop:
 	// and remove all messages that are still in pruneMsgs after processing the chains
 	log.Infof("Pruning %d messages", len(pruneMsgs))
 	for _, m := range pruneMsgs {
-		mp.remove(m.Message.From, m.Message.Nonce)
+		mp.remove(m.Message.From, m.Message.Nonce, false)
 	}
 
 	return nil

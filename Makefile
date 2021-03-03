@@ -5,10 +5,10 @@ all: build
 
 unexport GOFLAGS
 
-GOVERSION:=$(shell go version | cut -d' ' -f 3 | cut -d. -f 2)
-ifeq ($(shell expr $(GOVERSION) \< 14), 1)
-$(warning Your Golang version is go 1.$(GOVERSION))
-$(error Update Golang to version $(shell grep '^go' go.mod))
+GOVERSION:=$(shell go version | cut -d' ' -f 3 | sed 's/^go//' | awk -F. '{printf "%d%03d%03d", $$1, $$2, $$3}')
+ifeq ($(shell expr $(GOVERSION) \< 1015005), 1)
+$(warning Your Golang version is go$(shell expr $(GOVERSION) / 1000000).$(shell expr $(GOVERSION) % 1000000 / 1000).$(shell expr $(GOVERSION) % 1000))
+$(error Update Golang to version to at least 1.15.5)
 endif
 
 # git modules that need to be loaded
@@ -41,8 +41,14 @@ MODULES+=$(FFI_PATH)
 BUILD_DEPS+=build/.filecoin-install
 CLEAN+=build/.filecoin-install
 
-$(MODULES): build/.update-modules ;
+ffi-version-check:
+	@[[ "$$(awk '/const Version/{print $$5}' extern/filecoin-ffi/version.go)" -eq 2 ]] || (echo "FFI version mismatch, update submodules"; exit 1)
+BUILD_DEPS+=ffi-version-check
 
+.PHONY: ffi-version-check
+
+
+$(MODULES): build/.update-modules ;
 # dummy file that marks the last time modules were updated
 build/.update-modules:
 	git submodule update --init --recursive
@@ -62,6 +68,15 @@ debug: lotus lotus-miner lotus-worker lotus-seed
 
 2k: GOFLAGS+=-tags=2k
 2k: lotus lotus-miner lotus-worker lotus-seed
+
+calibnet: GOFLAGS+=-tags=calibnet
+calibnet: lotus lotus-miner lotus-worker lotus-seed
+
+nerpanet: GOFLAGS+=-tags=nerpanet
+nerpanet: lotus lotus-miner lotus-worker lotus-seed
+
+butterflynet: GOFLAGS+=-tags=butterflynet
+butterflynet: lotus lotus-miner lotus-worker lotus-seed
 
 lotus: $(BUILD_DEPS)
 	rm -f lotus
@@ -91,6 +106,12 @@ lotus-shed: $(BUILD_DEPS)
 	go run github.com/GeertJohan/go.rice/rice append --exec lotus-shed -i ./build
 .PHONY: lotus-shed
 BINS+=lotus-shed
+
+lotus-gateway: $(BUILD_DEPS)
+	rm -f lotus-gateway
+	go build $(GOFLAGS) -o lotus-gateway ./cmd/lotus-gateway
+.PHONY: lotus-gateway
+BINS+=lotus-gateway
 
 build: lotus lotus-miner lotus-worker
 	@[[ $$(type -P "lotus") ]] && echo "Caution: you have \
@@ -127,17 +148,29 @@ benchmarks:
 
 lotus-pond: 2k
 	go build -o lotus-pond ./lotuspond
-	(cd lotuspond/front && npm i && CI=false npm run build)
 .PHONY: lotus-pond
 BINS+=lotus-pond
+
+lotus-pond-front:
+	(cd lotuspond/front && npm i && CI=false npm run build)
+.PHONY: lotus-pond-front
+
+lotus-pond-app: lotus-pond-front lotus-pond
+.PHONY: lotus-pond-app
 
 lotus-townhall:
 	rm -f lotus-townhall
 	go build -o lotus-townhall ./cmd/lotus-townhall
-	(cd ./cmd/lotus-townhall/townhall && npm i && npm run build)
-	go run github.com/GeertJohan/go.rice/rice append --exec lotus-townhall -i ./cmd/lotus-townhall -i ./build
 .PHONY: lotus-townhall
 BINS+=lotus-townhall
+
+lotus-townhall-front:
+	(cd ./cmd/lotus-townhall/townhall && npm i && npm run build)
+.PHONY: lotus-townhall-front
+
+lotus-townhall-app: lotus-touch lotus-townhall-front
+	go run github.com/GeertJohan/go.rice/rice append --exec lotus-townhall -i ./cmd/lotus-townhall -i ./build
+.PHONY: lotus-townhall-app
 
 lotus-fountain:
 	rm -f lotus-fountain
@@ -161,7 +194,7 @@ BINS+=lotus-bench
 
 lotus-stats:
 	rm -f lotus-stats
-	go build -o lotus-stats ./cmd/lotus-stats
+	go build $(GOFLAGS) -o lotus-stats ./cmd/lotus-stats
 	go run github.com/GeertJohan/go.rice/rice append --exec lotus-stats -i ./build
 .PHONY: lotus-stats
 BINS+=lotus-stats
@@ -179,6 +212,18 @@ lotus-health:
 	go run github.com/GeertJohan/go.rice/rice append --exec lotus-health -i ./build
 .PHONY: lotus-health
 BINS+=lotus-health
+
+lotus-wallet:
+	rm -f lotus-wallet
+	go build -o lotus-wallet ./cmd/lotus-wallet
+.PHONY: lotus-wallet
+BINS+=lotus-wallet
+
+lotus-keygen:
+	rm -f lotus-keygen
+	go build -o lotus-keygen ./cmd/lotus-keygen
+.PHONY: lotus-keygen
+BINS+=lotus-keygen
 
 testground:
 	go build -tags testground -o /dev/null ./cmd/lotus
@@ -278,6 +323,11 @@ method-gen:
 	(cd ./lotuspond/front/src/chain && go run ./methodgen.go)
 
 gen: type-gen method-gen
+
+docsgen:
+	go run ./api/docgen "api/api_full.go" "FullNode" > documentation/en/api-methods.md
+	go run ./api/docgen "api/api_storage.go" "StorageMiner" > documentation/en/api-methods-miner.md
+	go run ./api/docgen "api/api_worker.go" "WorkerAPI" > documentation/en/api-methods-worker.md
 
 print-%:
 	@echo $*=$($*)

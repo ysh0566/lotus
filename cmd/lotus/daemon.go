@@ -3,18 +3,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"runtime/pprof"
 	"strings"
 
-	"github.com/filecoin-project/lotus/chain/types"
-
 	paramfetch "github.com/filecoin-project/go-paramfetch"
+	metricsprom "github.com/ipfs/go-metrics-prometheus"
 	"github.com/mitchellh/go-homedir"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/urfave/cli/v2"
@@ -23,15 +25,17 @@ import (
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
 	"golang.org/x/xerrors"
+	"gopkg.in/cheggaaa/pb.v1"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
+	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
-	"github.com/filecoin-project/lotus/lib/blockstore"
+	"github.com/filecoin-project/lotus/journal"
 	"github.com/filecoin-project/lotus/lib/peermgr"
 	"github.com/filecoin-project/lotus/lib/ulimit"
 	"github.com/filecoin-project/lotus/metrics"
@@ -100,11 +104,20 @@ var DaemonCmd = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name:  "import-chain",
-			Usage: "on first run, load chain from given file",
+			Usage: "on first run, load chain from given file or url and validate",
+		},
+		&cli.StringFlag{
+			Name:  "import-snapshot",
+			Usage: "import chain state from a given chain export file or url",
 		},
 		&cli.BoolFlag{
 			Name:  "halt-after-import",
 			Usage: "halt the process after importing chain from file",
+		},
+		&cli.BoolFlag{
+			Name:   "lite",
+			Usage:  "start lotus in lite mode",
+			Hidden: true,
 		},
 		&cli.StringFlag{
 			Name:  "pprof",
@@ -119,8 +132,30 @@ var DaemonCmd = &cli.Command{
 			Usage: "manage open file limit",
 			Value: true,
 		},
+		&cli.StringFlag{
+			Name:  "config",
+			Usage: "specify path of config file to use",
+		},
+		// FIXME: This is not the correct place to put this configuration
+		//  option. Ideally it would be part of `config.toml` but at the
+		//  moment that only applies to the node configuration and not outside
+		//  components like the RPC server.
+		&cli.IntFlag{
+			Name:  "api-max-req-size",
+			Usage: "maximum API request size accepted by the JSON RPC server",
+		},
+		&cli.PathFlag{
+			Name:  "restore",
+			Usage: "restore from backup file",
+		},
+		&cli.PathFlag{
+			Name:  "restore-config",
+			Usage: "config file to use when restoring from backup",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
+		isLite := cctx.Bool("lite")
+
 		err := runmetrics.Enable(runmetrics.RunMetricOptions{
 			EnableCPU:    true,
 			EnableMemory: true,
@@ -172,12 +207,20 @@ var DaemonCmd = &cli.Command{
 			return xerrors.Errorf("opening fs repo: %w", err)
 		}
 
-		if err := r.Init(repo.FullNode); err != nil && err != repo.ErrRepoExists {
-			return xerrors.Errorf("repo init error: %w", err)
+		if cctx.String("config") != "" {
+			r.SetConfigPath(cctx.String("config"))
 		}
 
-		if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), 0); err != nil {
-			return xerrors.Errorf("fetching proof parameters: %w", err)
+		err = r.Init(repo.FullNode)
+		if err != nil && err != repo.ErrRepoExists {
+			return xerrors.Errorf("repo init error: %w", err)
+		}
+		freshRepo := err != repo.ErrRepoExists
+
+		if !isLite {
+			if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), 0); err != nil {
+				return xerrors.Errorf("fetching proof parameters: %w", err)
+			}
 		}
 
 		var genBytes []byte
@@ -190,14 +233,28 @@ var DaemonCmd = &cli.Command{
 			genBytes = build.MaybeGenesis()
 		}
 
+		if cctx.IsSet("restore") {
+			if !freshRepo {
+				return xerrors.Errorf("restoring from backup is only possible with a fresh repo!")
+			}
+			if err := restore(cctx, r); err != nil {
+				return xerrors.Errorf("restoring from backup: %w", err)
+			}
+		}
+
 		chainfile := cctx.String("import-chain")
-		if chainfile != "" {
-			chainfile, err := homedir.Expand(chainfile)
-			if err != nil {
-				return err
+		snapshot := cctx.String("import-snapshot")
+		if chainfile != "" || snapshot != "" {
+			if chainfile != "" && snapshot != "" {
+				return fmt.Errorf("cannot specify both 'import-snapshot' and 'import-chain'")
+			}
+			var issnapshot bool
+			if chainfile == "" {
+				chainfile = snapshot
+				issnapshot = true
 			}
 
-			if err := ImportChain(r, chainfile); err != nil {
+			if err := ImportChain(ctx, r, chainfile, issnapshot); err != nil {
 				return err
 			}
 			if cctx.Bool("halt-after-import") {
@@ -219,10 +276,29 @@ var DaemonCmd = &cli.Command{
 
 		shutdownChan := make(chan struct{})
 
-		var api api.FullNode
+		// If the daemon is started in "lite mode", provide a  GatewayAPI
+		// for RPC calls
+		liteModeDeps := node.Options()
+		if isLite {
+			gapi, closer, err := lcli.GetGatewayAPI(cctx)
+			if err != nil {
+				return err
+			}
 
+			defer closer()
+			liteModeDeps = node.Override(new(api.GatewayAPI), gapi)
+		}
+
+		// some libraries like ipfs/go-ds-measure and ipfs/go-ipfs-blockstore
+		// use ipfs/go-metrics-interface. This injects a Prometheus exporter
+		// for those. Metrics are exported to the default registry.
+		if err := metricsprom.Inject(); err != nil {
+			log.Warnf("unable to inject prometheus ipfs/go-metrics exporter; some metrics will be unavailable; err: %s", err)
+		}
+
+		var api api.FullNode
 		stop, err := node.New(ctx,
-			node.FullAPI(&api),
+			node.FullAPI(&api, node.Lite(isLite)),
 
 			node.Override(new(dtypes.Bootstrapper), isBootstrapper),
 			node.Override(new(dtypes.ShutdownChan), shutdownChan),
@@ -230,6 +306,7 @@ var DaemonCmd = &cli.Command{
 			node.Repo(r),
 
 			genesis,
+			liteModeDeps,
 
 			node.ApplyIf(func(s *node.Settings) bool { return cctx.IsSet("api") },
 				node.Override(node.SetApiEndpointKey, func(lr repo.LockedRepo) error {
@@ -271,7 +348,7 @@ var DaemonCmd = &cli.Command{
 		}
 
 		// TODO: properly parse api endpoint (or make it a URL)
-		return serveRPC(api, stop, endpoint, shutdownChan)
+		return serveRPC(api, stop, endpoint, shutdownChan, int64(cctx.Int("api-max-req-size")))
 	},
 	Subcommands: []*cli.Command{
 		daemonStopCmd,
@@ -308,16 +385,46 @@ func importKey(ctx context.Context, api api.FullNode, f string) error {
 		return err
 	}
 
-	log.Info("successfully imported key for %s", addr)
+	log.Infof("successfully imported key for %s", addr)
 	return nil
 }
 
-func ImportChain(r repo.Repo, fname string) error {
-	fi, err := os.Open(fname)
-	if err != nil {
-		return err
+func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) (err error) {
+	var rd io.Reader
+	var l int64
+	if strings.HasPrefix(fname, "http://") || strings.HasPrefix(fname, "https://") {
+		resp, err := http.Get(fname) //nolint:gosec
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close() //nolint:errcheck
+
+		if resp.StatusCode != http.StatusOK {
+			return xerrors.Errorf("non-200 response: %d", resp.StatusCode)
+		}
+
+		rd = resp.Body
+		l = resp.ContentLength
+	} else {
+		fname, err = homedir.Expand(fname)
+		if err != nil {
+			return err
+		}
+
+		fi, err := os.Open(fname)
+		if err != nil {
+			return err
+		}
+		defer fi.Close() //nolint:errcheck
+
+		st, err := os.Stat(fname)
+		if err != nil {
+			return err
+		}
+
+		rd = fi
+		l = st.Size()
 	}
-	defer fi.Close() //nolint:errcheck
 
 	lr, err := r.Lock(repo.FullNode)
 	if err != nil {
@@ -325,35 +432,68 @@ func ImportChain(r repo.Repo, fname string) error {
 	}
 	defer lr.Close() //nolint:errcheck
 
-	ds, err := lr.Datastore("/chain")
+	bs, err := lr.Blockstore(ctx, repo.BlockstoreChain)
+	if err != nil {
+		return xerrors.Errorf("failed to open blockstore: %w", err)
+	}
+
+	mds, err := lr.Datastore(context.TODO(), "/metadata")
 	if err != nil {
 		return err
 	}
 
-	mds, err := lr.Datastore("/metadata")
+	j, err := journal.OpenFSJournal(lr, journal.EnvDisabledEvents())
 	if err != nil {
-		return err
+		return xerrors.Errorf("failed to open journal: %w", err)
 	}
 
-	bs := blockstore.NewBlockstore(ds)
+	cst := store.NewChainStore(bs, bs, mds, vm.Syscalls(ffiwrapper.ProofVerifier), j)
+	defer cst.Close() //nolint:errcheck
 
-	cst := store.NewChainStore(bs, mds, vm.Syscalls(ffiwrapper.ProofVerifier))
+	log.Infof("importing chain from %s...", fname)
 
-	log.Info("importing chain from file...")
-	ts, err := cst.Import(fi)
+	bufr := bufio.NewReaderSize(rd, 1<<20)
+
+	bar := pb.New64(l)
+	br := bar.NewProxyReader(bufr)
+	bar.ShowTimeLeft = true
+	bar.ShowPercent = true
+	bar.ShowSpeed = true
+	bar.Units = pb.U_BYTES
+
+	bar.Start()
+	ts, err := cst.Import(br)
+	bar.Finish()
+
 	if err != nil {
 		return xerrors.Errorf("importing chain failed: %w", err)
 	}
 
-	stm := stmgr.NewStateManager(cst)
-
-	log.Infof("validating imported chain...")
-	if err := stm.ValidateChain(context.TODO(), ts); err != nil {
-		return xerrors.Errorf("chain validation failed: %w", err)
+	if err := cst.FlushValidationCache(); err != nil {
+		return xerrors.Errorf("flushing validation cache failed: %w", err)
 	}
 
-	log.Info("accepting %s as new head", ts.Cids())
-	if err := cst.SetHead(ts); err != nil {
+	gb, err := cst.GetTipsetByHeight(ctx, 0, ts, true)
+	if err != nil {
+		return err
+	}
+
+	err = cst.SetGenesis(gb.Blocks()[0])
+	if err != nil {
+		return err
+	}
+
+	stm := stmgr.NewStateManager(cst)
+
+	if !snapshot {
+		log.Infof("validating imported chain...")
+		if err := stm.ValidateChain(ctx, ts); err != nil {
+			return xerrors.Errorf("chain validation failed: %w", err)
+		}
+	}
+
+	log.Infof("accepting %s as new head", ts.Cids())
+	if err := cst.ForceHeadSilent(ctx, ts); err != nil {
 		return err
 	}
 

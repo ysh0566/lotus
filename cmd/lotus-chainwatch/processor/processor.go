@@ -8,15 +8,14 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/builtin"
+	"github.com/filecoin-project/go-state-types/abi"
+	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -36,9 +35,6 @@ type Processor struct {
 
 	// number of blocks processed at a time
 	batch int
-
-	// process communication channels
-	sectorDealEvents chan *SectorDealEvent
 }
 
 type ActorTips map[types.TipSetKey][]actorInfo
@@ -88,6 +84,10 @@ func (p *Processor) setupSchemas() error {
 		return err
 	}
 
+	if err := p.setupPower(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -134,58 +134,69 @@ func (p *Processor) Start(ctx context.Context) {
 					log.Fatalw("Failed to collect actor changes", "error", err)
 				}
 				log.Infow("Collected Actor Changes",
-					"MarketChanges", len(actorChanges[builtin.StorageMarketActorCodeID]),
-					"MinerChanges", len(actorChanges[builtin.StorageMinerActorCodeID]),
-					"RewardChanges", len(actorChanges[builtin.RewardActorCodeID]),
-					"AccountChanges", len(actorChanges[builtin.AccountActorCodeID]),
+					"MarketChanges", len(actorChanges[builtin2.StorageMarketActorCodeID]),
+					"MinerChanges", len(actorChanges[builtin2.StorageMinerActorCodeID]),
+					"RewardChanges", len(actorChanges[builtin2.RewardActorCodeID]),
+					"AccountChanges", len(actorChanges[builtin2.AccountActorCodeID]),
 					"nullRounds", len(nullRounds))
 
-				grp, ctx := errgroup.WithContext(ctx)
+				grp := sync.WaitGroup{}
 
-				grp.Go(func() error {
-					if err := p.HandleMarketChanges(ctx, actorChanges[builtin.StorageMarketActorCodeID]); err != nil {
-						return xerrors.Errorf("Failed to handle market changes: %w", err)
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
+					if err := p.HandleMarketChanges(ctx, actorChanges[builtin2.StorageMarketActorCodeID]); err != nil {
+						log.Errorf("Failed to handle market changes: %v", err)
+						return
 					}
-					log.Info("Processed Market Changes")
-					return nil
-				})
+				}()
 
-				grp.Go(func() error {
-					if err := p.HandleMinerChanges(ctx, actorChanges[builtin.StorageMinerActorCodeID]); err != nil {
-						return xerrors.Errorf("Failed to handle miner changes: %w", err)
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
+					if err := p.HandleMinerChanges(ctx, actorChanges[builtin2.StorageMinerActorCodeID]); err != nil {
+						log.Errorf("Failed to handle miner changes: %v", err)
+						return
 					}
-					log.Info("Processed Miner Changes")
-					return nil
-				})
+				}()
 
-				grp.Go(func() error {
-					if err := p.HandleRewardChanges(ctx, actorChanges[builtin.RewardActorCodeID], nullRounds); err != nil {
-						return xerrors.Errorf("Failed to handle reward changes: %w", err)
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
+					if err := p.HandleRewardChanges(ctx, actorChanges[builtin2.RewardActorCodeID], nullRounds); err != nil {
+						log.Errorf("Failed to handle reward changes: %v", err)
+						return
 					}
-					log.Info("Processed Reward Changes")
-					return nil
-				})
+				}()
 
-				grp.Go(func() error {
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
+					if err := p.HandlePowerChanges(ctx, actorChanges[builtin2.StoragePowerActorCodeID]); err != nil {
+						log.Errorf("Failed to handle power actor changes: %v", err)
+						return
+					}
+				}()
+
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
 					if err := p.HandleMessageChanges(ctx, toProcess); err != nil {
-						return xerrors.Errorf("Failed to handle message changes: %w", err)
+						log.Errorf("Failed to handle message changes: %v", err)
+						return
 					}
-					log.Info("Processed Message Changes")
-					return nil
-				})
+				}()
 
-				grp.Go(func() error {
+				grp.Add(1)
+				go func() {
+					defer grp.Done()
 					if err := p.HandleCommonActorsChanges(ctx, actorChanges); err != nil {
-						return xerrors.Errorf("Failed to handle common actor changes: %w", err)
+						log.Errorf("Failed to handle common actor changes: %v", err)
+						return
 					}
-					log.Info("Processed CommonActor Changes")
-					return nil
-				})
+				}()
 
-				if err := grp.Wait(); err != nil {
-					log.Errorw("Failed to handle actor changes...retrying", "error", err)
-					continue
-				}
+				grp.Wait()
 
 				if err := p.markBlocksProcessed(ctx, toProcess); err != nil {
 					log.Fatalw("Failed to mark blocks as processed", "error", err)
@@ -194,7 +205,7 @@ func (p *Processor) Start(ctx context.Context) {
 				if err := p.refreshViews(); err != nil {
 					log.Errorw("Failed to refresh views", "error", err)
 				}
-				log.Infow("Processed Batch", "duration", time.Since(loopStart).String())
+				log.Infow("Processed Batch Complete", "duration", time.Since(loopStart).String())
 			}
 		}
 	}()
@@ -235,7 +246,8 @@ func (p *Processor) collectActorChanges(ctx context.Context, toProcess map[cid.C
 
 		pts, err := p.node.ChainGetTipSet(ctx, types.NewTipSetKey(bh.Parents...))
 		if err != nil {
-			panic(err)
+			log.Error(err)
+			return
 		}
 
 		if pts.ParentState().Equals(bh.ParentStateRoot) {
@@ -249,7 +261,9 @@ func (p *Processor) collectActorChanges(ctx context.Context, toProcess map[cid.C
 		// a separate strategy for deleted actors
 		changes, err = p.node.StateChangedActors(ctx, pts.ParentState(), bh.ParentStateRoot)
 		if err != nil {
-			panic(err)
+			log.Error(err)
+			log.Debugw("StateChangedActors", "grandparent_state", pts.ParentState(), "parent_state", bh.ParentStateRoot)
+			return
 		}
 
 		// record the state of all actors that have changed
@@ -260,7 +274,9 @@ func (p *Processor) collectActorChanges(ctx context.Context, toProcess map[cid.C
 			// ignore actors that were deleted.
 			has, err := p.node.ChainHasObj(ctx, act.Head)
 			if err != nil {
-				log.Fatal(err)
+				log.Error(err)
+				log.Debugw("ChanHasObj", "actor_head", act.Head)
+				return
 			}
 			if !has {
 				continue
@@ -268,19 +284,24 @@ func (p *Processor) collectActorChanges(ctx context.Context, toProcess map[cid.C
 
 			addr, err := address.NewFromString(a)
 			if err != nil {
-				log.Fatal(err.Error())
+				log.Error(err)
+				log.Debugw("NewFromString", "address_string", a)
+				return
 			}
 
 			ast, err := p.node.StateReadState(ctx, addr, pts.Key())
 			if err != nil {
-				log.Fatal(err.Error())
+				log.Error(err)
+				log.Debugw("StateReadState", "address_string", a, "parent_tipset_key", pts.Key())
+				return
 			}
 
 			// TODO look here for an empty state, maybe thats a sign the actor was deleted?
 
 			state, err := json.Marshal(ast.State)
 			if err != nil {
-				panic(err)
+				log.Error(err)
+				return
 			}
 
 			outMu.Lock()
@@ -313,10 +334,10 @@ func (p *Processor) unprocessedBlocks(ctx context.Context, batch int) (map[cid.C
 	}()
 	rows, err := p.db.Query(`
 with toProcess as (
-    select blocks.cid, blocks.height, rank() over (order by height) as rnk
-    from blocks
-        left join blocks_synced bs on blocks.cid = bs.cid
-    where bs.processed_at is null and blocks.height > 0
+    select b.cid, b.height, rank() over (order by height) as rnk
+    from blocks_synced bs
+        left join blocks b on bs.cid = b.cid
+    where bs.processed_at is null and b.height > 0
 )
 select cid
 from toProcess
@@ -358,7 +379,9 @@ where rnk <= $1
 			maxBlock = bh.Height
 		}
 	}
-	log.Infow("Gathered Blocks to Process", "start", minBlock, "end", maxBlock)
+	if minBlock <= maxBlock {
+		log.Infow("Gathered Blocks to Process", "start", minBlock, "end", maxBlock)
+	}
 	return out, rows.Close()
 }
 

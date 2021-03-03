@@ -7,7 +7,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/minio/blake2b-simd"
@@ -167,12 +167,16 @@ func (ts *TipSet) Equals(ots *TipSet) bool {
 		return false
 	}
 
-	if len(ts.blks) != len(ots.blks) {
+	if ts.height != ots.height {
 		return false
 	}
 
-	for i, b := range ts.blks {
-		if b.Cid() != ots.blks[i].Cid() {
+	if len(ts.cids) != len(ots.cids) {
+		return false
+	}
+
+	for i, cid := range ts.cids {
+		if cid != ots.cids[i] {
 			return false
 		}
 	}
@@ -237,4 +241,8 @@ func (ts *TipSet) IsChildOf(parent *TipSet) bool {
 		//  "parent", but many parts of the code rely on the tipset's
 		//  height for their processing logic at the moment to obviate it.
 		ts.height > parent.height
+}
+
+func (ts *TipSet) String() string {
+	return fmt.Sprintf("%v", ts.cids)
 }

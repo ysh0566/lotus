@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 
+	"github.com/ipfs/go-cid"
+
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 
 	sealing "github.com/filecoin-project/lotus/extern/storage-sealing"
 )
@@ -44,6 +46,22 @@ func (m *Miner) RemoveSector(ctx context.Context, id abi.SectorNumber) error {
 	return m.sealing.Remove(ctx, id)
 }
 
+func (m *Miner) TerminateSector(ctx context.Context, id abi.SectorNumber) error {
+	return m.sealing.Terminate(ctx, id)
+}
+
+func (m *Miner) TerminateFlush(ctx context.Context) (*cid.Cid, error) {
+	return m.sealing.TerminateFlush(ctx)
+}
+
+func (m *Miner) TerminatePending(ctx context.Context) ([]abi.SectorID, error) {
+	return m.sealing.TerminatePending(ctx)
+}
+
 func (m *Miner) MarkForUpgrade(id abi.SectorNumber) error {
 	return m.sealing.MarkForUpgrade(id)
+}
+
+func (m *Miner) IsMarkedForUpgrade(id abi.SectorNumber) bool {
+	return m.sealing.IsMarkedForUpgrade(id)
 }

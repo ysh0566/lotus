@@ -3,14 +3,16 @@ package slashfilter
 import (
 	"fmt"
 
+	"github.com/filecoin-project/lotus/build"
+
 	"golang.org/x/xerrors"
 
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/namespace"
 
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/specs-actors/actors/abi"
 )
 
 type SlashFilter struct {
@@ -26,6 +28,10 @@ func New(dstore ds.Batching) *SlashFilter {
 }
 
 func (f *SlashFilter) MinedBlock(bh *types.BlockHeader, parentEpoch abi.ChainEpoch) error {
+	if build.IsNearUpgrade(bh.Height, build.UpgradeOrangeHeight) {
+		return nil
+	}
+
 	epochKey := ds.NewKey(fmt.Sprintf("/%s/%d", bh.Miner, bh.Height))
 	{
 		// double-fork mining (2 blocks at one epoch)
@@ -103,6 +109,10 @@ func checkFault(t ds.Datastore, key ds.Key, bh *types.BlockHeader, faultType str
 		_, other, err := cid.CidFromBytes(cidb)
 		if err != nil {
 			return err
+		}
+
+		if other == bh.Cid() {
+			return nil
 		}
 
 		return xerrors.Errorf("produced block would trigger '%s' consensus fault; miner: %s; bh: %s, other: %s", faultType, bh.Miner, bh.Cid(), other)

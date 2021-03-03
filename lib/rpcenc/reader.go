@@ -19,8 +19,8 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-jsonrpc"
+	"github.com/filecoin-project/go-state-types/abi"
 	sealing "github.com/filecoin-project/lotus/extern/storage-sealing"
-	"github.com/filecoin-project/specs-actors/actors/abi"
 )
 
 var log = logging.Logger("rpcenc")
@@ -64,7 +64,7 @@ func ReaderParamEncoder(addr string) jsonrpc.Option {
 				return
 			}
 
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 
 			if resp.StatusCode != 200 {
 				b, _ := ioutil.ReadAll(resp.Body)
@@ -128,7 +128,7 @@ func ReaderParamDecoder() (http.HandlerFunc, jsonrpc.ServerOption) {
 		case ch <- wr:
 		case <-tctx.Done():
 			close(ch)
-			log.Error("context error in reader stream handler (1): %v", tctx.Err())
+			log.Errorf("context error in reader stream handler (1): %v", tctx.Err())
 			resp.WriteHeader(500)
 			return
 		}
@@ -136,7 +136,7 @@ func ReaderParamDecoder() (http.HandlerFunc, jsonrpc.ServerOption) {
 		select {
 		case <-wr.wait:
 		case <-req.Context().Done():
-			log.Error("context error in reader stream handler (2): %v", req.Context().Err())
+			log.Errorf("context error in reader stream handler (2): %v", req.Context().Err())
 			resp.WriteHeader(500)
 			return
 		}

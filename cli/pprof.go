@@ -9,7 +9,6 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/lotus/node/repo"
-	manet "github.com/multiformats/go-multiaddr-net"
 )
 
 var pprofCmd = &cli.Command{
@@ -37,14 +36,14 @@ var PprofGoroutines = &cli.Command{
 		if err != nil {
 			return xerrors.Errorf("could not get API info: %w", err)
 		}
-		_, addr, err := manet.DialArgs(ainfo.Addr)
+		addr, err := ainfo.Host()
 		if err != nil {
 			return err
 		}
 
 		addr = "http://" + addr + "/debug/pprof/goroutine?debug=2"
 
-		r, err := http.Get(addr)
+		r, err := http.Get(addr) //nolint:gosec
 		if err != nil {
 			return err
 		}

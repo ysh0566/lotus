@@ -3,34 +3,32 @@ package test
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/filecoin-project/specs-actors/actors/builtin"
-
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
-	"github.com/filecoin-project/specs-actors/actors/builtin/paych"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 	"github.com/ipfs/go-cid"
 
 	"github.com/filecoin-project/go-address"
+	cbor "github.com/ipfs/go-ipld-cbor"
 
 	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/api/apibstore"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
+	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/events"
 	"github.com/filecoin-project/lotus/chain/events/state"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/chain/wallet"
-	"github.com/filecoin-project/lotus/miner"
 )
 
 func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
-	_ = os.Setenv("BELLMAN_NO_GPU", "1")
-
 	ctx := context.Background()
-	n, sn := b(t, 2, oneMiner)
+	n, sn := b(t, TwoFull, OneMiner)
 
 	paymentCreator := n[0]
 	paymentReceiver := n[1]
@@ -51,16 +49,16 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 	}
 
 	// start mining blocks
-	bm := newBlockMiner(ctx, t, miner, blocktime)
-	bm.mineBlocks()
+	bm := NewBlockMiner(ctx, t, miner, blocktime)
+	bm.MineBlocks()
 
 	// send some funds to register the receiver
-	receiverAddr, err := paymentReceiver.WalletNew(ctx, wallet.ActSigType("secp256k1"))
+	receiverAddr, err := paymentReceiver.WalletNew(ctx, types.KTSecp256k1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	sendFunds(ctx, t, paymentCreator, receiverAddr, abi.NewTokenAmount(1e18))
+	SendFunds(ctx, t, paymentCreator, receiverAddr, abi.NewTokenAmount(1e18))
 
 	// setup the payment channel
 	createrAddr, err := paymentCreator.WalletDefaultAddress(ctx)
@@ -68,7 +66,7 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		t.Fatal(err)
 	}
 
-	channelAmt := int64(100000)
+	channelAmt := int64(7000)
 	channelInfo, err := paymentCreator.PaychGet(ctx, createrAddr, receiverAddr, abi.NewTokenAmount(channelAmt))
 	if err != nil {
 		t.Fatal(err)
@@ -97,18 +95,24 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if vouch1.Voucher == nil {
+			t.Fatal(fmt.Errorf("Not enough funds to create voucher: missing %d", vouch1.Shortfall))
+		}
 		vouch2, err := paymentCreator.PaychVoucherCreate(ctx, channel, abi.NewTokenAmount(2000), lane)
 		if err != nil {
 			t.Fatal(err)
 		}
-		delta1, err := paymentReceiver.PaychVoucherAdd(ctx, channel, vouch1, nil, abi.NewTokenAmount(1000))
+		if vouch2.Voucher == nil {
+			t.Fatal(fmt.Errorf("Not enough funds to create voucher: missing %d", vouch2.Shortfall))
+		}
+		delta1, err := paymentReceiver.PaychVoucherAdd(ctx, channel, vouch1.Voucher, nil, abi.NewTokenAmount(1000))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !delta1.Equals(abi.NewTokenAmount(1000)) {
 			t.Fatal("voucher didn't have the right amount")
 		}
-		delta2, err := paymentReceiver.PaychVoucherAdd(ctx, channel, vouch2, nil, abi.NewTokenAmount(1000))
+		delta2, err := paymentReceiver.PaychVoucherAdd(ctx, channel, vouch2.Voucher, nil, abi.NewTokenAmount(1000))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,17 +132,26 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		t.Fatal("Unable to settle payment channel")
 	}
 
+	creatorStore := adt.WrapStore(ctx, cbor.NewCborStore(apibstore.NewAPIBlockstore(paymentCreator)))
+
 	// wait for the receiver to submit their vouchers
 	ev := events.NewEvents(ctx, paymentCreator)
 	preds := state.NewStatePredicates(paymentCreator)
 	finished := make(chan struct{})
 	err = ev.StateChanged(func(ts *types.TipSet) (done bool, more bool, err error) {
-		act, err := paymentCreator.StateReadState(ctx, channel, ts.Key())
+		act, err := paymentCreator.StateGetActor(ctx, channel, ts.Key())
 		if err != nil {
 			return false, false, err
 		}
-		state := act.State.(paych.State)
-		if state.ToSend.GreaterThanEqual(abi.NewTokenAmount(6000)) {
+		state, err := paych.Load(creatorStore, act)
+		if err != nil {
+			return false, false, err
+		}
+		toSend, err := state.ToSend()
+		if err != nil {
+			return false, false, err
+		}
+		if toSend.GreaterThanEqual(abi.NewTokenAmount(6000)) {
 			return true, false, nil
 		}
 		return false, true, nil
@@ -151,9 +164,12 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		return true, nil
 	}, func(ctx context.Context, ts *types.TipSet) error {
 		return nil
-	}, int(build.MessageConfidence)+1, build.SealRandomnessLookbackLimit, func(oldTs, newTs *types.TipSet) (bool, events.StateChange, error) {
+	}, int(build.MessageConfidence)+1, build.Finality, func(oldTs, newTs *types.TipSet) (bool, events.StateChange, error) {
 		return preds.OnPaymentChannelActorChanged(channel, preds.OnToSendAmountChanges())(ctx, oldTs.Key(), newTs.Key())
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-finished:
@@ -161,8 +177,53 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 		t.Fatal("Timed out waiting for receiver to submit vouchers")
 	}
 
+	// Create a new voucher now that some vouchers have already been submitted
+	vouchRes, err := paymentCreator.PaychVoucherCreate(ctx, channel, abi.NewTokenAmount(1000), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vouchRes.Voucher == nil {
+		t.Fatal(fmt.Errorf("Not enough funds to create voucher: missing %d", vouchRes.Shortfall))
+	}
+	vdelta, err := paymentReceiver.PaychVoucherAdd(ctx, channel, vouchRes.Voucher, nil, abi.NewTokenAmount(1000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !vdelta.Equals(abi.NewTokenAmount(1000)) {
+		t.Fatal("voucher didn't have the right amount")
+	}
+
+	// Create a new voucher whose value would exceed the channel balance
+	excessAmt := abi.NewTokenAmount(1000)
+	vouchRes, err = paymentCreator.PaychVoucherCreate(ctx, channel, excessAmt, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vouchRes.Voucher != nil {
+		t.Fatal("Expected not to be able to create voucher whose value would exceed channel balance")
+	}
+	if !vouchRes.Shortfall.Equals(excessAmt) {
+		t.Fatal(fmt.Errorf("Expected voucher shortfall of %d, got %d", excessAmt, vouchRes.Shortfall))
+	}
+
+	// Add a voucher whose value would exceed the channel balance
+	vouch := &paych.SignedVoucher{ChannelAddr: channel, Amount: excessAmt, Lane: 4, Nonce: 1}
+	vb, err := vouch.SigningBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := paymentCreator.WalletSign(ctx, createrAddr, vb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vouch.Signature = sig
+	_, err = paymentReceiver.PaychVoucherAdd(ctx, channel, vouch, nil, abi.NewTokenAmount(1000))
+	if err == nil {
+		t.Fatal(fmt.Errorf("Expected shortfall error of %d", excessAmt))
+	}
+
 	// wait for the settlement period to pass before collecting
-	waitForBlocks(ctx, t, bm, paymentReceiver, receiverAddr, paych.SettleDelay)
+	waitForBlocks(ctx, t, bm, paymentReceiver, receiverAddr, policy.PaychSettleDelay)
 
 	creatorPreCollectBalance, err := paymentCreator.WalletBalance(ctx, createrAddr)
 	if err != nil {
@@ -201,10 +262,10 @@ func TestPaymentChannels(t *testing.T, b APIBuilder, blocktime time.Duration) {
 	}
 
 	// shut down mining
-	bm.stop()
+	bm.Stop()
 }
 
-func waitForBlocks(ctx context.Context, t *testing.T, bm *blockMiner, paymentReceiver TestNode, receiverAddr address.Address, count int) {
+func waitForBlocks(ctx context.Context, t *testing.T, bm *BlockMiner, paymentReceiver TestNode, receiverAddr address.Address, count int) {
 	// We need to add null blocks in batches, if we add too many the chain can't sync
 	batchSize := 60
 	for i := 0; i < count; i += batchSize {
@@ -248,74 +309,4 @@ func waitForMessage(ctx context.Context, t *testing.T, paymentCreator TestNode, 
 	}
 	fmt.Println("Confirmed", desc)
 	return res
-}
-
-type blockMiner struct {
-	ctx       context.Context
-	t         *testing.T
-	miner     TestStorageNode
-	blocktime time.Duration
-	mine      int64
-	nulls     int64
-	done      chan struct{}
-}
-
-func newBlockMiner(ctx context.Context, t *testing.T, miner TestStorageNode, blocktime time.Duration) *blockMiner {
-	return &blockMiner{
-		ctx:       ctx,
-		t:         t,
-		miner:     miner,
-		blocktime: blocktime,
-		mine:      int64(1),
-		done:      make(chan struct{}),
-	}
-}
-
-func (bm *blockMiner) mineBlocks() {
-	time.Sleep(time.Second)
-	go func() {
-		defer close(bm.done)
-		for atomic.LoadInt64(&bm.mine) == 1 {
-			time.Sleep(bm.blocktime)
-			nulls := atomic.SwapInt64(&bm.nulls, 0)
-			if err := bm.miner.MineOne(bm.ctx, miner.MineReq{
-				InjectNulls: abi.ChainEpoch(nulls),
-				Done:        func(bool, error) {},
-			}); err != nil {
-				bm.t.Error(err)
-			}
-		}
-	}()
-}
-
-func (bm *blockMiner) stop() {
-	atomic.AddInt64(&bm.mine, -1)
-	fmt.Println("shutting down mining")
-	<-bm.done
-}
-
-func sendFunds(ctx context.Context, t *testing.T, sender TestNode, addr address.Address, amount abi.TokenAmount) {
-
-	senderAddr, err := sender.WalletDefaultAddress(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	msg := &types.Message{
-		From:  senderAddr,
-		To:    addr,
-		Value: amount,
-	}
-
-	sm, err := sender.MpoolPushMessage(ctx, msg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := sender.StateWaitMsg(ctx, sm.Cid(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Receipt.ExitCode != 0 {
-		t.Fatal("did not successfully send money")
-	}
 }

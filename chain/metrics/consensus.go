@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -44,7 +44,7 @@ func SendHeadNotifs(nickname string) func(mctx helpers.MetricsCtx, lc fx.Lifecyc
 					}
 				}()
 				go func() {
-					sub, err := ps.Subscribe(topic)
+					sub, err := ps.Subscribe(topic) //nolint
 					if err != nil {
 						return
 					}
@@ -116,6 +116,7 @@ func sendHeadNotifs(ctx context.Context, ps *pubsub.PubSub, topic string, chain 
 				return err
 			}
 
+			//nolint
 			if err := ps.Publish(topic, b); err != nil {
 				return err
 			}
